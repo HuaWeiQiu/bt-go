@@ -1,20 +1,29 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
+	"mime"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/anacrolix/torrent"
 	"github.com/anacrolix/torrent/metainfo"
+	"go.etcd.io/bbolt"
+	"golang.org/x/time/rate"
 )
 
 type server struct {
@@ -22,56 +31,157 @@ type server struct {
 }
 
 type downloadManager struct {
-	client  *torrent.Client
-	dataDir string
-	mu      sync.RWMutex
-	tasks   map[string]*downloadTask
+	client      *torrent.Client
+	dataDir     string
+	rateLimiter *rate.Limiter
+	state       *stateStore
+
+	settingsMu sync.RWMutex
+	settings   appSettings
+
+	mu    sync.RWMutex
+	tasks map[string]*downloadTask
+}
+
+type taskMoveRequest struct {
+	Direction string `json:"direction"`
 }
 
 type downloadTask struct {
-	ID        string    `json:"id"`
-	Magnet    string    `json:"magnet"`
-	Name      string    `json:"name"`
-	InfoHash  string    `json:"infoHash"`
-	Status    string    `json:"status"`
-	SavePath  string    `json:"savePath"`
-	CreatedAt time.Time `json:"createdAt"`
-	UpdatedAt time.Time `json:"updatedAt"`
-	Error     string    `json:"error,omitempty"`
+	ID                string    `json:"id"`
+	Magnet            string    `json:"magnet"`
+	Name              string    `json:"name"`
+	InfoHash          string    `json:"infoHash"`
+	Status            string    `json:"status"`
+	SavePath          string    `json:"savePath"`
+	Source            string    `json:"source"`
+	Trackers          []string  `json:"trackers"`
+	Order             int64     `json:"order"`
+	CreatedAt         time.Time `json:"createdAt"`
+	UpdatedAt         time.Time `json:"updatedAt"`
+	Error             string    `json:"error,omitempty"`
+	Active            bool      `json:"active"`
+	Paused            bool      `json:"paused"`
+	AwaitingSelection bool      `json:"awaitingSelection"`
 
-	torrent *torrent.Torrent
-	mu      sync.Mutex
-	last    progressSample
+	metaInfo         []byte
+	fileSelection    map[string]bool
+	filePriorities   map[string]string
+	fileSelectionSet bool
+	torrent          *torrent.Torrent
+	mu               sync.Mutex
+	last             progressSample
+	done             chan struct{}
+	stopOnce         sync.Once
 }
 
 type progressSample struct {
-	At        time.Time
-	Completed int64
-	Speed     float64
+	At         time.Time
+	ProgressAt time.Time
+	Completed  int64
+	Speed      float64
 }
 
 type addRequest struct {
 	Magnet string `json:"magnet"`
 }
 
+type appSettings struct {
+	MaxActiveDownloads     int   `json:"maxActiveDownloads"`
+	DownloadRateLimitBytes int64 `json:"downloadRateLimitBytes"`
+	WaitForFileSelection   bool  `json:"waitForFileSelection"`
+}
+
+type persistedState struct {
+	Settings appSettings     `json:"settings"`
+	Tasks    []persistedTask `json:"tasks"`
+}
+
+type persistedTask struct {
+	ID                string            `json:"id"`
+	Magnet            string            `json:"magnet"`
+	Name              string            `json:"name"`
+	InfoHash          string            `json:"infoHash"`
+	Source            string            `json:"source"`
+	Trackers          []string          `json:"trackers"`
+	MetaInfo          []byte            `json:"metaInfo,omitempty"`
+	Files             []string          `json:"files,omitempty"`
+	FilePriorities    map[string]string `json:"filePriorities,omitempty"`
+	FileSelectionSet  bool              `json:"fileSelectionSet,omitempty"`
+	Order             int64             `json:"order"`
+	Paused            bool              `json:"paused"`
+	AwaitingSelection bool              `json:"awaitingSelection"`
+	CreatedAt         time.Time         `json:"createdAt"`
+	UpdatedAt         time.Time         `json:"updatedAt"`
+}
+
+type fileSelectionRequest struct {
+	Files      []string          `json:"files"`
+	Priorities map[string]string `json:"priorities"`
+}
+
+type openPathRequest struct {
+	Path string `json:"path"`
+}
+
+type taskFileStatus struct {
+	Path            string  `json:"path"`
+	Size            int64   `json:"size"`
+	CompletedBytes  int64   `json:"completedBytes"`
+	ProgressPercent float64 `json:"progressPercent"`
+	Selected        bool    `json:"selected"`
+	Priority        string  `json:"priority"`
+}
+
+type stateStore struct {
+	db *bbolt.DB
+}
+
+var errTaskNotFound = errors.New("task not found")
+
 type taskStatus struct {
-	ID              string    `json:"id"`
-	Name            string    `json:"name"`
-	InfoHash        string    `json:"infoHash"`
-	Status          string    `json:"status"`
-	SavePath        string    `json:"savePath"`
-	CreatedAt       time.Time `json:"createdAt"`
-	UpdatedAt       time.Time `json:"updatedAt"`
-	Error           string    `json:"error,omitempty"`
-	TotalBytes      int64     `json:"totalBytes"`
-	CompletedBytes  int64     `json:"completedBytes"`
-	DownloadSpeed   float64   `json:"downloadSpeed"`
-	ProgressPercent float64   `json:"progressPercent"`
-	BytesMissing    int64     `json:"bytesMissing"`
-	Peers           int       `json:"peers"`
-	ActivePeers     int       `json:"activePeers"`
-	Seeders         int       `json:"seeders"`
-	MetadataReady   bool      `json:"metadataReady"`
+	ID                string           `json:"id"`
+	Magnet            string           `json:"magnet"`
+	Name              string           `json:"name"`
+	InfoHash          string           `json:"infoHash"`
+	Status            string           `json:"status"`
+	SavePath          string           `json:"savePath"`
+	Source            string           `json:"source"`
+	Order             int64            `json:"order"`
+	CreatedAt         time.Time        `json:"createdAt"`
+	UpdatedAt         time.Time        `json:"updatedAt"`
+	Error             string           `json:"error,omitempty"`
+	Active            bool             `json:"active"`
+	Paused            bool             `json:"paused"`
+	AwaitingSelection bool             `json:"awaitingSelection"`
+	Diagnostic        string           `json:"diagnostic"`
+	DiagnosticCode    string           `json:"diagnosticCode"`
+	Queued            bool             `json:"queued"`
+	QueuePosition     int              `json:"queuePosition"`
+	Trackers          []string         `json:"trackers"`
+	TrackerCount      int              `json:"trackerCount"`
+	DHTEnabled        bool             `json:"dhtEnabled"`
+	DHTServers        int              `json:"dhtServers"`
+	ListenAddrs       []string         `json:"listenAddrs"`
+	KnownPeers        int              `json:"knownPeers"`
+	BytesReadData     int64            `json:"bytesReadData"`
+	BytesWasted       int64            `json:"bytesWasted"`
+	MetadataAge       int64            `json:"metadataAgeSeconds"`
+	ETASeconds        int64            `json:"etaSeconds"`
+	Stalled           bool             `json:"stalled"`
+	StalledSeconds    int64            `json:"stalledSeconds"`
+	TotalBytes        int64            `json:"totalBytes"`
+	CompletedBytes    int64            `json:"completedBytes"`
+	DownloadSpeed     float64          `json:"downloadSpeed"`
+	ProgressPercent   float64          `json:"progressPercent"`
+	BytesMissing      int64            `json:"bytesMissing"`
+	Peers             int              `json:"peers"`
+	PendingPeers      int              `json:"pendingPeers"`
+	HalfOpenPeers     int              `json:"halfOpenPeers"`
+	ActivePeers       int              `json:"activePeers"`
+	Seeders           int              `json:"seeders"`
+	MetadataReady     bool             `json:"metadataReady"`
+	Files             []taskFileStatus `json:"files,omitempty"`
 }
 
 func newServer(dataDir string, listenPort int) (*server, func(), string, error) {
@@ -87,24 +197,60 @@ func newServer(dataDir string, listenPort int) (*server, func(), string, error) 
 	cfg.DataDir = absDir
 	cfg.Seed = true
 	cfg.NoUpload = false
+	cfg.NoDefaultPortForwarding = false
+	cfg.DisablePEX = false
 	cfg.DisableTCP = false
 	cfg.DisableUTP = false
 	cfg.ListenPort = listenPort
+	downloadRateLimiter := rate.NewLimiter(rate.Inf, 1<<20)
+	cfg.DownloadRateLimiter = downloadRateLimiter
+	cfg.TorrentPeersLowWater = 50
+	cfg.TorrentPeersHighWater = 500
+	cfg.EstablishedConnsPerTorrent = 80
+	cfg.HalfOpenConnsPerTorrent = 30
+	cfg.TotalHalfOpenConns = 100
 
 	client, err := torrent.NewClient(cfg)
 	if err != nil {
 		return nil, nil, "", fmt.Errorf("start torrent client: %w", err)
 	}
+	state, err := openStateStore(absDir)
+	if err != nil {
+		_ = client.Close()
+		return nil, nil, "", fmt.Errorf("open state store: %w", err)
+	}
+	persisted, err := state.load()
+	if err != nil {
+		_ = state.Close()
+		_ = client.Close()
+		return nil, nil, "", fmt.Errorf("load state: %w", err)
+	}
 
 	srv := &server{
 		downloads: &downloadManager{
-			client:  client,
-			dataDir: absDir,
-			tasks:   make(map[string]*downloadTask),
+			client:      client,
+			dataDir:     absDir,
+			rateLimiter: downloadRateLimiter,
+			state:       state,
+			settings:    defaultAppSettings(),
+			tasks:       make(map[string]*downloadTask),
 		},
+	}
+	if persisted.Settings.MaxActiveDownloads > 0 || persisted.Settings.DownloadRateLimitBytes > 0 {
+		if _, err := srv.downloads.applySettings(persisted.Settings); err != nil {
+			_ = state.Close()
+			_ = client.Close()
+			return nil, nil, "", fmt.Errorf("apply saved settings: %w", err)
+		}
+	}
+	if err := srv.downloads.restoreTasks(persisted.Tasks); err != nil {
+		_ = state.Close()
+		_ = client.Close()
+		return nil, nil, "", fmt.Errorf("restore tasks: %w", err)
 	}
 	return srv, func() {
 		_ = client.Close()
+		_ = state.Close()
 	}, absDir, nil
 }
 
@@ -116,7 +262,19 @@ func newMux(srv *server) http.Handler {
 	mux.HandleFunc("GET /api/tasks", srv.listTasks)
 	mux.HandleFunc("GET /api/tasks/{id}", srv.getTask)
 	mux.HandleFunc("DELETE /api/tasks/{id}", srv.deleteTask)
+	mux.HandleFunc("POST /api/tasks/{id}/pause", srv.pauseTask)
+	mux.HandleFunc("POST /api/tasks/{id}/resume", srv.resumeTask)
+	mux.HandleFunc("POST /api/tasks/{id}/move", srv.moveTask)
+	mux.HandleFunc("PUT /api/tasks/{id}/files", srv.updateTaskFiles)
+	mux.HandleFunc("POST /api/tasks/{id}/open", srv.openTaskPath)
+	mux.HandleFunc("POST /api/tasks/{id}/refresh-discovery", srv.refreshTaskDiscovery)
+	mux.HandleFunc("POST /api/tasks/pause-all", srv.pauseAllTasks)
+	mux.HandleFunc("POST /api/tasks/resume-all", srv.resumeAllTasks)
+	mux.HandleFunc("POST /api/open-download-dir", srv.openDownloadDir)
 	mux.HandleFunc("POST /api/parse", srv.parseMagnet)
+	mux.HandleFunc("POST /api/torrents", srv.addTorrentFile)
+	mux.HandleFunc("GET /api/settings", srv.getSettings)
+	mux.HandleFunc("PUT /api/settings", srv.updateSettings)
 	return logRequest(cors(mux))
 }
 
@@ -167,9 +325,10 @@ func (s *server) parseMagnet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"name":     mi.DisplayName,
-		"infoHash": mi.InfoHash.HexString(),
-		"trackers": trackers(mi),
+		"name":         mi.DisplayName,
+		"infoHash":     mi.InfoHash.HexString(),
+		"trackers":     trackers(mi),
+		"trackerCount": len(mi.Trackers),
 	})
 }
 
@@ -180,6 +339,55 @@ func (s *server) addTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	task, err := s.downloads.add(req.Magnet)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, s.downloads.status(task))
+}
+
+func (s *server) addTorrentFile(w http.ResponseWriter, r *http.Request) {
+	reader, err := r.MultipartReader()
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "multipart form body is required")
+		return
+	}
+
+	var body io.Reader
+	for {
+		part, err := reader.NextPart()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "read multipart body: "+err.Error())
+			return
+		}
+		if part.FormName() != "file" {
+			_ = part.Close()
+			continue
+		}
+		contentType := part.Header.Get("Content-Type")
+		if contentType != "" {
+			if mediaType, _, err := mime.ParseMediaType(contentType); err == nil {
+				contentType = mediaType
+			}
+		}
+		if part.FileName() != "" && !strings.HasSuffix(strings.ToLower(part.FileName()), ".torrent") && contentType != "application/x-bittorrent" {
+			_ = part.Close()
+			writeError(w, http.StatusBadRequest, "torrent file is required")
+			return
+		}
+		body = part
+		defer part.Close()
+		break
+	}
+	if body == nil {
+		writeError(w, http.StatusBadRequest, "torrent file is required")
+		return
+	}
+
+	task, err := s.downloads.addTorrent(body)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -201,11 +409,155 @@ func (s *server) getTask(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) deleteTask(w http.ResponseWriter, r *http.Request) {
-	if !s.downloads.delete(r.PathValue("id")) {
+	deleted, err := s.downloads.delete(r.PathValue("id"), r.URL.Query().Get("deleteFiles") == "true")
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if !deleted {
 		writeError(w, http.StatusNotFound, "task not found")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"deleted": true})
+}
+
+func (s *server) pauseTask(w http.ResponseWriter, r *http.Request) {
+	task, err := s.downloads.pause(r.PathValue("id"))
+	if err != nil {
+		if errors.Is(err, errTaskNotFound) {
+			writeError(w, http.StatusNotFound, "task not found")
+			return
+		}
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, s.downloads.status(task))
+}
+
+func (s *server) resumeTask(w http.ResponseWriter, r *http.Request) {
+	task, err := s.downloads.resume(r.PathValue("id"))
+	if err != nil {
+		if errors.Is(err, errTaskNotFound) {
+			writeError(w, http.StatusNotFound, "task not found")
+			return
+		}
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, s.downloads.status(task))
+}
+
+func (s *server) pauseAllTasks(w http.ResponseWriter, _ *http.Request) {
+	if err := s.downloads.pauseAll(); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, s.downloads.list())
+}
+
+func (s *server) resumeAllTasks(w http.ResponseWriter, _ *http.Request) {
+	if err := s.downloads.resumeAll(); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, s.downloads.list())
+}
+
+func (s *server) moveTask(w http.ResponseWriter, r *http.Request) {
+	var req taskMoveRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json body")
+		return
+	}
+	task, err := s.downloads.move(r.PathValue("id"), req.Direction)
+	if err != nil {
+		if errors.Is(err, errTaskNotFound) {
+			writeError(w, http.StatusNotFound, "task not found")
+			return
+		}
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, s.downloads.status(task))
+}
+
+func (s *server) updateTaskFiles(w http.ResponseWriter, r *http.Request) {
+	var req fileSelectionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json body")
+		return
+	}
+	task, err := s.downloads.updateFileSelection(r.PathValue("id"), req)
+	if err != nil {
+		if errors.Is(err, errTaskNotFound) {
+			writeError(w, http.StatusNotFound, "task not found")
+			return
+		}
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, s.downloads.status(task))
+}
+
+func (s *server) openDownloadDir(w http.ResponseWriter, _ *http.Request) {
+	if err := openLocalPath(s.downloads.dataDir); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"opened": true})
+}
+
+func (s *server) openTaskPath(w http.ResponseWriter, r *http.Request) {
+	var req openPathRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+		writeError(w, http.StatusBadRequest, "invalid json body")
+		return
+	}
+	path, err := s.downloads.taskOpenPath(r.PathValue("id"), req.Path)
+	if err != nil {
+		if errors.Is(err, errTaskNotFound) {
+			writeError(w, http.StatusNotFound, "task not found")
+			return
+		}
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := openLocalPath(path); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"opened": true})
+}
+
+func (s *server) refreshTaskDiscovery(w http.ResponseWriter, r *http.Request) {
+	task, err := s.downloads.refreshDiscovery(r.PathValue("id"))
+	if err != nil {
+		if errors.Is(err, errTaskNotFound) {
+			writeError(w, http.StatusNotFound, "task not found")
+			return
+		}
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, s.downloads.status(task))
+}
+
+func (s *server) getSettings(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, s.downloads.getSettings())
+}
+
+func (s *server) updateSettings(w http.ResponseWriter, r *http.Request) {
+	var req appSettings
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json body")
+		return
+	}
+	settings, err := s.downloads.updateSettings(req)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, settings)
 }
 
 func (m *downloadManager) add(magnet string) (*downloadTask, error) {
@@ -222,10 +574,13 @@ func (m *downloadManager) add(magnet string) (*downloadTask, error) {
 	}
 	m.mu.Unlock()
 
-	t, err := m.client.AddMagnet(magnet)
+	trackerList := trackers(mi)
+	t, err := m.client.AddMagnet(mi.String())
 	if err != nil {
 		return nil, fmt.Errorf("add magnet: %w", err)
 	}
+	t.AddTrackers(trackerTiers(trackerList))
+	t.DisallowDataDownload()
 
 	now := time.Now()
 	task := &downloadTask{
@@ -235,17 +590,195 @@ func (m *downloadManager) add(magnet string) (*downloadTask, error) {
 		InfoHash:  id,
 		Status:    "metadata",
 		SavePath:  m.dataDir,
+		Source:    "magnet",
+		Trackers:  trackerList,
+		Order:     m.nextOrder(),
 		CreatedAt: now,
 		UpdatedAt: now,
 		torrent:   t,
+		done:      make(chan struct{}),
+	}
+	if m.getSettings().WaitForFileSelection && t.Info() != nil {
+		task.AwaitingSelection = true
+		task.Status = "awaiting_selection"
 	}
 
 	m.mu.Lock()
 	m.tasks[id] = task
 	m.mu.Unlock()
 
+	if err := m.saveState(); err != nil {
+		_, _ = m.delete(id, false)
+		return nil, err
+	}
+	m.schedule()
 	go m.watch(task)
 	return task, nil
+}
+
+func (m *downloadManager) addTorrent(r io.Reader) (*downloadTask, error) {
+	raw, err := io.ReadAll(io.LimitReader(r, 128<<20))
+	if err != nil {
+		return nil, fmt.Errorf("read torrent file: %w", err)
+	}
+	if len(raw) == 0 {
+		return nil, errors.New("torrent file is empty")
+	}
+	mi, err := metainfo.Load(bytes.NewReader(raw))
+	if err != nil {
+		return nil, fmt.Errorf("parse torrent file: %w", err)
+	}
+	info, err := mi.UnmarshalInfo()
+	if err != nil {
+		return nil, fmt.Errorf("parse torrent info: %w", err)
+	}
+	magnet := mi.Magnet(nil, &info)
+	magnet.Trackers = mergeTrackers(magnet.Trackers, defaultPublicTrackers)
+	id := magnet.InfoHash.HexString()
+
+	m.mu.Lock()
+	if existing, ok := m.tasks[id]; ok {
+		m.mu.Unlock()
+		return existing, nil
+	}
+	m.mu.Unlock()
+
+	spec := torrent.TorrentSpecFromMetaInfo(mi)
+	spec.Trackers = trackerTiers(magnet.Trackers)
+	spec.DisallowDataDownload = true
+	t, _, err := m.client.AddTorrentSpec(spec)
+	if err != nil {
+		return nil, fmt.Errorf("add torrent file: %w", err)
+	}
+	t.AddTrackers(trackerTiers(magnet.Trackers))
+	t.DisallowDataDownload()
+
+	now := time.Now()
+	task := &downloadTask{
+		ID:        id,
+		Magnet:    magnet.String(),
+		Name:      info.BestName(),
+		InfoHash:  id,
+		Status:    "metadata",
+		SavePath:  m.dataDir,
+		Source:    "torrent",
+		Trackers:  trackers(&magnet),
+		Order:     m.nextOrder(),
+		CreatedAt: now,
+		UpdatedAt: now,
+		metaInfo:  raw,
+		torrent:   t,
+		done:      make(chan struct{}),
+	}
+	if m.getSettings().WaitForFileSelection && t.Info() != nil {
+		task.AwaitingSelection = true
+		task.Status = "awaiting_selection"
+	}
+
+	m.mu.Lock()
+	m.tasks[id] = task
+	m.mu.Unlock()
+
+	if err := m.saveState(); err != nil {
+		_, _ = m.delete(id, false)
+		return nil, err
+	}
+	m.schedule()
+	go m.watch(task)
+	return task, nil
+}
+
+func (m *downloadManager) restoreTasks(saved []persistedTask) error {
+	sort.Slice(saved, func(i, j int) bool {
+		return persistedTaskOrderLess(saved[i], saved[j])
+	})
+	nextOrder := int64(1)
+	for _, savedTask := range saved {
+		mi, err := parseMagnet(savedTask.Magnet)
+		if err != nil {
+			log.Printf("skip saved task %s: %v", savedTask.ID, err)
+			continue
+		}
+		id := mi.InfoHash.HexString()
+		if savedTask.ID != "" {
+			id = savedTask.ID
+		}
+		trackerList := mergeTrackers(savedTask.Trackers, mi.Trackers)
+		var t *torrent.Torrent
+		if len(savedTask.MetaInfo) > 0 {
+			meta, err := metainfo.Load(bytes.NewReader(savedTask.MetaInfo))
+			if err != nil {
+				log.Printf("saved torrent metadata for %s is invalid, falling back to magnet: %v", savedTask.ID, err)
+			} else {
+				spec := torrent.TorrentSpecFromMetaInfo(meta)
+				spec.Trackers = trackerTiers(trackerList)
+				spec.DisallowDataDownload = true
+				t, _, err = m.client.AddTorrentSpec(spec)
+				if err != nil {
+					log.Printf("saved torrent metadata for %s failed, falling back to magnet: %v", savedTask.ID, err)
+					t = nil
+				}
+			}
+		}
+		if t == nil {
+			t, err = m.client.AddMagnet(mi.String())
+			if err != nil {
+				log.Printf("skip saved task %s: %v", savedTask.ID, err)
+				continue
+			}
+		}
+		t.AddTrackers(trackerTiers(trackerList))
+		t.DisallowDataDownload()
+		createdAt := savedTask.CreatedAt
+		if createdAt.IsZero() {
+			createdAt = time.Now()
+		}
+		updatedAt := savedTask.UpdatedAt
+		if updatedAt.IsZero() {
+			updatedAt = createdAt
+		}
+		order := savedTask.Order
+		if order <= 0 {
+			order = nextOrder
+		}
+		if order >= nextOrder {
+			nextOrder = order + 1
+		}
+		task := &downloadTask{
+			ID:                id,
+			Magnet:            savedTask.Magnet,
+			Name:              savedTask.Name,
+			InfoHash:          id,
+			Status:            "metadata",
+			SavePath:          m.dataDir,
+			Source:            savedTask.Source,
+			Trackers:          trackerList,
+			Order:             order,
+			Paused:            savedTask.Paused,
+			AwaitingSelection: savedTask.AwaitingSelection,
+			CreatedAt:         createdAt,
+			UpdatedAt:         updatedAt,
+			metaInfo:          append([]byte(nil), savedTask.MetaInfo...),
+			fileSelection:     selectionFromList(savedTask.Files),
+			filePriorities:    prioritiesFromState(savedTask.Files, savedTask.FilePriorities),
+			fileSelectionSet:  savedTask.FileSelectionSet || len(savedTask.Files) > 0,
+			torrent:           t,
+			done:              make(chan struct{}),
+		}
+		if task.Paused {
+			task.Status = "paused"
+		}
+		if task.Source == "" {
+			task.Source = "magnet"
+		}
+		task.applyFileSelection()
+		m.mu.Lock()
+		m.tasks[id] = task
+		m.mu.Unlock()
+		go m.watch(task)
+	}
+	m.schedule()
+	return nil
 }
 
 func (m *downloadManager) get(id string) (*downloadTask, bool) {
@@ -262,6 +795,7 @@ func (m *downloadManager) list() []taskStatus {
 		tasks = append(tasks, task)
 	}
 	m.mu.RUnlock()
+	sortTasks(tasks)
 
 	result := make([]taskStatus, 0, len(tasks))
 	for _, task := range tasks {
@@ -270,63 +804,444 @@ func (m *downloadManager) list() []taskStatus {
 	return result
 }
 
-func (m *downloadManager) delete(id string) bool {
+func (m *downloadManager) delete(id string, deleteFiles bool) (bool, error) {
 	m.mu.Lock()
 	task, ok := m.tasks[id]
+	var filePaths []string
 	if ok {
+		if deleteFiles {
+			filePaths = task.filePaths()
+		}
 		delete(m.tasks, id)
 		task.setState("stopped", "")
+		task.stop()
 	}
 	m.mu.Unlock()
 
 	if ok && task.torrent != nil {
 		task.torrent.Drop()
 	}
-	return ok
+	if ok {
+		if deleteFiles {
+			if err := m.deleteTaskFiles(task, filePaths); err != nil {
+				return true, err
+			}
+		}
+		if err := m.saveState(); err != nil {
+			log.Printf("save state after delete failed: %v", err)
+		}
+		m.schedule()
+	}
+	return ok, nil
+}
+
+func (m *downloadManager) pause(id string) (*downloadTask, error) {
+	task, ok := m.get(id)
+	if !ok {
+		return nil, errTaskNotFound
+	}
+	task.pauseByUser()
+	if err := m.saveState(); err != nil {
+		return nil, err
+	}
+	m.schedule()
+	return task, nil
+}
+
+func (m *downloadManager) resume(id string) (*downloadTask, error) {
+	task, ok := m.get(id)
+	if !ok {
+		return nil, errTaskNotFound
+	}
+	task.resumeByUser()
+	if err := m.saveState(); err != nil {
+		return nil, err
+	}
+	m.schedule()
+	return task, nil
+}
+
+func (m *downloadManager) pauseAll() error {
+	m.mu.RLock()
+	tasks := make([]*downloadTask, 0, len(m.tasks))
+	for _, task := range m.tasks {
+		tasks = append(tasks, task)
+	}
+	m.mu.RUnlock()
+	for _, task := range tasks {
+		task.pauseByUser()
+	}
+	if err := m.saveState(); err != nil {
+		return err
+	}
+	m.schedule()
+	return nil
+}
+
+func (m *downloadManager) resumeAll() error {
+	m.mu.RLock()
+	tasks := make([]*downloadTask, 0, len(m.tasks))
+	for _, task := range m.tasks {
+		tasks = append(tasks, task)
+	}
+	m.mu.RUnlock()
+	for _, task := range tasks {
+		task.resumeByUser()
+	}
+	if err := m.saveState(); err != nil {
+		return err
+	}
+	m.schedule()
+	return nil
+}
+
+func (m *downloadManager) move(id, direction string) (*downloadTask, error) {
+	direction = strings.TrimSpace(strings.ToLower(direction))
+	m.mu.RLock()
+	tasks := make([]*downloadTask, 0, len(m.tasks))
+	task, ok := m.tasks[id]
+	for _, item := range m.tasks {
+		tasks = append(tasks, item)
+	}
+	m.mu.RUnlock()
+	if !ok {
+		return nil, errTaskNotFound
+	}
+	sortTasks(tasks)
+	index := -1
+	for i, item := range tasks {
+		if item.ID == id {
+			index = i
+			break
+		}
+	}
+	if index < 0 {
+		return nil, errTaskNotFound
+	}
+	switch direction {
+	case "top":
+		if index > 0 {
+			tasks = append(append([]*downloadTask{task}, tasks[:index]...), tasks[index+1:]...)
+			reindexTasks(tasks)
+		}
+	case "bottom":
+		if index < len(tasks)-1 {
+			tasks = append(append(tasks[:index], tasks[index+1:]...), task)
+			reindexTasks(tasks)
+		}
+	case "up":
+		if index > 0 {
+			tasks[index], tasks[index-1] = tasks[index-1], tasks[index]
+			reindexTasks(tasks)
+		}
+	case "down":
+		if index < len(tasks)-1 {
+			tasks[index], tasks[index+1] = tasks[index+1], tasks[index]
+			reindexTasks(tasks)
+		}
+	default:
+		return nil, errors.New("direction must be top, up, down, or bottom")
+	}
+	if err := m.saveState(); err != nil {
+		return nil, err
+	}
+	m.schedule()
+	return task, nil
+}
+
+func (m *downloadManager) updateFileSelection(id string, req fileSelectionRequest) (*downloadTask, error) {
+	task, ok := m.get(id)
+	if !ok {
+		return nil, errTaskNotFound
+	}
+	if task.torrent == nil || task.torrent.Info() == nil {
+		return nil, errors.New("metadata is not ready")
+	}
+	allowed := make(map[string]struct{})
+	for _, file := range task.torrent.Files() {
+		if file == nil {
+			continue
+		}
+		allowed[file.DisplayPath()] = struct{}{}
+	}
+	priorities := make(map[string]string, len(req.Priorities)+len(req.Files))
+	for file, priority := range req.Priorities {
+		file = strings.TrimSpace(filepath.ToSlash(file))
+		if file == "" {
+			continue
+		}
+		if _, ok := allowed[file]; !ok {
+			return nil, fmt.Errorf("unknown file: %s", file)
+		}
+		normalized, err := normalizeFilePriority(priority)
+		if err != nil {
+			return nil, err
+		}
+		priorities[file] = normalized
+	}
+	for _, file := range req.Files {
+		file = strings.TrimSpace(filepath.ToSlash(file))
+		if file == "" {
+			continue
+		}
+		if _, ok := allowed[file]; !ok {
+			return nil, fmt.Errorf("unknown file: %s", file)
+		}
+		if _, ok := priorities[file]; !ok {
+			priorities[file] = "normal"
+		}
+	}
+	task.setFilePriorities(priorities, true)
+	if err := m.saveState(); err != nil {
+		return nil, err
+	}
+	m.schedule()
+	return task, nil
+}
+
+func (m *downloadManager) taskOpenPath(id, relPath string) (string, error) {
+	task, ok := m.get(id)
+	if !ok {
+		return "", errTaskNotFound
+	}
+	task.mu.Lock()
+	savePath := task.SavePath
+	name := task.Name
+	task.mu.Unlock()
+	target := savePath
+	relPath = strings.TrimSpace(relPath)
+	if relPath != "" {
+		if task.torrent == nil || task.torrent.Info() == nil {
+			return "", errors.New("metadata is not ready")
+		}
+		found := false
+		for _, file := range task.torrent.Files() {
+			if file != nil && (file.DisplayPath() == relPath || file.Path() == relPath) {
+				target = filepath.Join(savePath, filepath.FromSlash(file.Path()))
+				found = true
+				break
+			}
+		}
+		if !found {
+			return "", fmt.Errorf("unknown file: %s", relPath)
+		}
+		if _, err := os.Stat(target); err != nil {
+			parent := filepath.Dir(target)
+			if _, parentErr := os.Stat(parent); parentErr == nil {
+				target = parent
+			} else {
+				target = savePath
+			}
+		}
+	} else if name != "" {
+		candidate := filepath.Join(savePath, name)
+		if _, err := os.Stat(candidate); err == nil {
+			target = candidate
+		}
+	}
+	return safeChildPath(m.dataDir, target)
+}
+
+func (m *downloadManager) refreshDiscovery(id string) (*downloadTask, error) {
+	task, ok := m.get(id)
+	if !ok {
+		return nil, errTaskNotFound
+	}
+	task.mu.Lock()
+	tor := task.torrent
+	trackers := append([]string(nil), task.Trackers...)
+	task.UpdatedAt = time.Now()
+	task.mu.Unlock()
+	if tor == nil {
+		return nil, errors.New("torrent is not ready")
+	}
+	if len(trackers) > 0 {
+		tor.AddTrackers(trackerTiers(trackers))
+	}
+	for _, dhtServer := range m.client.DhtServers() {
+		done, stop, err := tor.AnnounceToDht(dhtServer)
+		if err != nil {
+			continue
+		}
+		go func() {
+			select {
+			case <-done:
+			case <-time.After(45 * time.Second):
+				stop()
+			}
+		}()
+	}
+	m.schedule()
+	return task, nil
+}
+
+func (m *downloadManager) deleteTaskFiles(task *downloadTask, paths []string) error {
+	if len(paths) == 0 {
+		if task.Name != "" {
+			paths = []string{filepath.Join(task.SavePath, task.Name)}
+		}
+	}
+	for _, path := range paths {
+		cleaned, err := safeChildPath(m.dataDir, path)
+		if err != nil {
+			return err
+		}
+		if err := os.Remove(cleaned); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("delete file %s: %w", cleaned, err)
+		}
+		removeEmptyParents(filepath.Dir(cleaned), m.dataDir)
+	}
+	return nil
+}
+
+func (m *downloadManager) getSettings() appSettings {
+	m.settingsMu.RLock()
+	settings := m.settings
+	m.settingsMu.RUnlock()
+	if settings.MaxActiveDownloads < 1 {
+		settings.MaxActiveDownloads = 1
+	}
+	if settings.DownloadRateLimitBytes < 0 {
+		settings.DownloadRateLimitBytes = 0
+	}
+	return settings
+}
+
+func defaultAppSettings() appSettings {
+	return appSettings{
+		MaxActiveDownloads:     3,
+		DownloadRateLimitBytes: 0,
+		WaitForFileSelection:   false,
+	}
+}
+
+func (m *downloadManager) applySettings(settings appSettings) (appSettings, error) {
+	if settings.MaxActiveDownloads < 1 {
+		return appSettings{}, errors.New("maxActiveDownloads must be at least 1")
+	}
+	if settings.MaxActiveDownloads > 50 {
+		return appSettings{}, errors.New("maxActiveDownloads must be 50 or less")
+	}
+	if settings.DownloadRateLimitBytes < 0 {
+		return appSettings{}, errors.New("downloadRateLimitBytes must be zero or greater")
+	}
+	if settings.DownloadRateLimitBytes == 0 {
+		m.rateLimiter.SetLimit(rate.Inf)
+		m.rateLimiter.SetBurst(1 << 20)
+	} else {
+		m.rateLimiter.SetLimit(rate.Limit(settings.DownloadRateLimitBytes))
+		m.rateLimiter.SetBurst(max(int(settings.DownloadRateLimitBytes), 1<<20))
+	}
+
+	m.settingsMu.Lock()
+	m.settings = settings
+	m.settingsMu.Unlock()
+	return settings, nil
+}
+
+func (m *downloadManager) updateSettings(settings appSettings) (appSettings, error) {
+	settings, err := m.applySettings(settings)
+	if err != nil {
+		return appSettings{}, err
+	}
+	if err := m.saveState(); err != nil {
+		return appSettings{}, err
+	}
+	m.schedule()
+	return settings, nil
 }
 
 func (m *downloadManager) status(task *downloadTask) taskStatus {
 	var total, completed, missing int64
-	var peers, activePeers, seeders int
+	var peers, pendingPeers, halfOpenPeers, activePeers, seeders int
+	var knownPeers int
+	var bytesReadData, bytesWasted int64
 	metadataReady := false
+	var files []taskFileStatus
 	if task.torrent != nil {
 		stats := task.torrent.Stats()
 		peers = stats.TotalPeers
+		pendingPeers = stats.PendingPeers
+		halfOpenPeers = stats.HalfOpenPeers
 		activePeers = stats.ActivePeers
 		seeders = stats.ConnectedSeeders
-		metadataReady = task.torrent.Info() != nil
-		if metadataReady {
-			total = task.torrent.Length()
-			completed = task.torrent.BytesCompleted()
-			missing = task.torrent.BytesMissing()
-		}
+		knownPeers = len(task.torrent.KnownSwarm())
+		bytesReadData = stats.BytesReadData.Int64()
+		bytesWasted = stats.ChunksReadWasted.Int64()
 	}
+	total, completed, missing, files, metadataReady = task.progressSnapshot()
 
-	status, name, infoHash, savePath, createdAt, updatedAt, errText, speed := task.refreshWithProgress(completed)
+	status, name, infoHash, savePath, createdAt, updatedAt, errText, speed, progressAt := task.refreshWithProgress(completed, total, missing)
+	metadataAge := int64(0)
+	if !metadataReady && status == "metadata" && !createdAt.IsZero() {
+		metadataAge = int64(time.Since(createdAt).Seconds())
+	}
 
 	progress := 0.0
 	if total > 0 {
 		progress = float64(completed) * 100 / float64(total)
 	}
 
+	active := task.isActive()
+	paused := task.isPaused()
+	eta := int64(0)
+	if speed > 1 && missing > 0 {
+		eta = int64(float64(missing) / speed)
+	}
+	stalledSeconds := int64(0)
+	if active && missing > 0 && speed < 1 && !progressAt.IsZero() {
+		stalledSeconds = int64(time.Since(progressAt).Seconds())
+		if stalledSeconds < 0 {
+			stalledSeconds = 0
+		}
+	}
+	stalled := active && missing > 0 && speed < 1 && stalledSeconds >= 30
+	dhtServers := len(m.client.DhtServers())
+	listenAddrs := listenerStrings(m.client.ListenAddrs())
+	diagnosticCode, diagnostic := taskDiagnostic(status, metadataReady, active, paused, task.isAwaitingSelection(), missing, speed, metadataAge, stalledSeconds, peers, pendingPeers, halfOpenPeers, activePeers, seeders, len(task.Trackers), dhtServers, len(listenAddrs))
 	return taskStatus{
-		ID:              task.ID,
-		Name:            name,
-		InfoHash:        infoHash,
-		Status:          status,
-		SavePath:        savePath,
-		CreatedAt:       createdAt,
-		UpdatedAt:       updatedAt,
-		Error:           errText,
-		TotalBytes:      total,
-		CompletedBytes:  completed,
-		DownloadSpeed:   speed,
-		ProgressPercent: progress,
-		BytesMissing:    missing,
-		Peers:           peers,
-		ActivePeers:     activePeers,
-		Seeders:         seeders,
-		MetadataReady:   metadataReady,
+		ID:                task.ID,
+		Magnet:            task.Magnet,
+		Name:              name,
+		InfoHash:          infoHash,
+		Status:            status,
+		SavePath:          savePath,
+		Source:            task.Source,
+		Order:             task.Order,
+		CreatedAt:         createdAt,
+		UpdatedAt:         updatedAt,
+		Error:             errText,
+		Active:            active,
+		Paused:            paused,
+		AwaitingSelection: task.isAwaitingSelection(),
+		Diagnostic:        diagnostic,
+		DiagnosticCode:    diagnosticCode,
+		Queued:            metadataReady && status == "queued",
+		QueuePosition:     m.queuePosition(task.ID),
+		Trackers:          append([]string(nil), task.Trackers...),
+		TrackerCount:      len(task.Trackers),
+		DHTEnabled:        dhtServers > 0,
+		DHTServers:        dhtServers,
+		ListenAddrs:       listenAddrs,
+		KnownPeers:        knownPeers,
+		BytesReadData:     bytesReadData,
+		BytesWasted:       bytesWasted,
+		MetadataAge:       metadataAge,
+		ETASeconds:        eta,
+		Stalled:           stalled,
+		StalledSeconds:    stalledSeconds,
+		TotalBytes:        total,
+		CompletedBytes:    completed,
+		DownloadSpeed:     speed,
+		ProgressPercent:   progress,
+		BytesMissing:      missing,
+		Peers:             peers,
+		PendingPeers:      pendingPeers,
+		HalfOpenPeers:     halfOpenPeers,
+		ActivePeers:       activePeers,
+		Seeders:           seeders,
+		MetadataReady:     metadataReady,
+		Files:             files,
 	}
 }
 
@@ -334,8 +1249,17 @@ func (m *downloadManager) watch(task *downloadTask) {
 	select {
 	case <-task.torrent.GotInfo():
 		task.setName(task.torrent.Name())
-		task.setState("downloading", "")
-		task.torrent.DownloadAll()
+		if !task.isActive() && !task.isPaused() {
+			if m.getSettings().WaitForFileSelection && !task.hasFileSelectionSet() {
+				task.markAwaitingSelection()
+			} else {
+				task.setState("queued", "")
+			}
+		}
+		_ = m.saveState()
+		m.schedule()
+	case <-task.done:
+		return
 	case <-time.After(10 * time.Minute):
 		task.setState("metadata_timeout", "metadata not found within 10 minutes")
 		return
@@ -344,11 +1268,171 @@ func (m *downloadManager) watch(task *downloadTask) {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	for range ticker.C {
-		status, _, _, _, _, _, _, _ := task.refreshWithProgress(task.torrent.BytesCompleted())
+		select {
+		case <-task.done:
+			return
+		default:
+		}
+		wasActive := task.isActive()
+		total, completed, missing, _, _ := task.progressSnapshot()
+		status, _, _, _, _, _, _, _, _ := task.refreshWithProgress(completed, total, missing)
+		if status == "awaiting_selection" {
+			if wasActive {
+				task.setActive(false)
+				m.schedule()
+			}
+			continue
+		}
 		if status == "completed" || status == "stopped" {
+			if wasActive {
+				task.setActive(false)
+				m.schedule()
+			}
 			return
 		}
 	}
+}
+
+func (m *downloadManager) schedule() {
+	settings := m.getSettings()
+	limit := settings.MaxActiveDownloads
+	if limit < 1 {
+		limit = 1
+	}
+
+	m.mu.RLock()
+	tasks := make([]*downloadTask, 0, len(m.tasks))
+	for _, task := range m.tasks {
+		tasks = append(tasks, task)
+	}
+	m.mu.RUnlock()
+	sortTasks(tasks)
+
+	active := 0
+	for _, task := range tasks {
+		if task.isPaused() {
+			if task.isActive() {
+				task.pauseDownload()
+			}
+			continue
+		}
+		if task.isAwaitingSelection() {
+			if task.isActive() {
+				task.pauseDownload()
+			}
+			continue
+		}
+		if !task.canSchedule() {
+			if task.isActive() {
+				task.pauseDownload()
+			}
+			continue
+		}
+		if active < limit {
+			if !task.isActive() {
+				task.startDownload()
+			}
+			active++
+			continue
+		}
+		if task.isActive() {
+			task.pauseDownload()
+		} else {
+			task.markQueued()
+		}
+	}
+}
+
+func (m *downloadManager) queuePosition(id string) int {
+	settings := m.getSettings()
+	limit := settings.MaxActiveDownloads
+	if limit < 1 {
+		limit = 1
+	}
+
+	m.mu.RLock()
+	tasks := make([]*downloadTask, 0, len(m.tasks))
+	for _, task := range m.tasks {
+		tasks = append(tasks, task)
+	}
+	m.mu.RUnlock()
+	sortTasks(tasks)
+
+	activeOrEarlier := 0
+	waiting := 0
+	for _, task := range tasks {
+		if task.isPaused() {
+			continue
+		}
+		if task.isAwaitingSelection() {
+			continue
+		}
+		if !task.canSchedule() {
+			continue
+		}
+		if activeOrEarlier < limit {
+			activeOrEarlier++
+			if task.ID == id {
+				return 0
+			}
+			continue
+		}
+		waiting++
+		if task.ID == id {
+			return waiting
+		}
+	}
+	return 0
+}
+
+func (m *downloadManager) snapshotState() persistedState {
+	m.settingsMu.RLock()
+	settings := m.settings
+	m.settingsMu.RUnlock()
+
+	m.mu.RLock()
+	tasks := make([]*downloadTask, 0, len(m.tasks))
+	for _, task := range m.tasks {
+		tasks = append(tasks, task)
+	}
+	m.mu.RUnlock()
+	sortTasks(tasks)
+
+	savedTasks := make([]persistedTask, 0, len(tasks))
+	for _, task := range tasks {
+		task.mu.Lock()
+		if task.Status != "stopped" {
+			savedTasks = append(savedTasks, persistedTask{
+				ID:                task.ID,
+				Magnet:            task.Magnet,
+				Name:              task.Name,
+				InfoHash:          task.InfoHash,
+				Source:            task.Source,
+				Trackers:          append([]string(nil), task.Trackers...),
+				MetaInfo:          append([]byte(nil), task.metaInfo...),
+				Files:             task.selectedFilesLocked(),
+				FilePriorities:    task.filePrioritiesLocked(),
+				FileSelectionSet:  task.fileSelectionSet,
+				Order:             task.Order,
+				Paused:            task.Paused,
+				AwaitingSelection: task.AwaitingSelection,
+				CreatedAt:         task.CreatedAt,
+				UpdatedAt:         task.UpdatedAt,
+			})
+		}
+		task.mu.Unlock()
+	}
+	return persistedState{
+		Settings: settings,
+		Tasks:    savedTasks,
+	}
+}
+
+func (m *downloadManager) saveState() error {
+	if m.state == nil {
+		return nil
+	}
+	return m.state.save(m.snapshotState())
 }
 
 func (t *downloadTask) setName(name string) {
@@ -369,15 +1453,408 @@ func (t *downloadTask) setState(status, errText string) {
 	t.mu.Unlock()
 }
 
-func (t *downloadTask) refreshWithProgress(completed int64) (status, name, infoHash, savePath string, createdAt, updatedAt time.Time, errText string, speed float64) {
+func (t *downloadTask) setActive(active bool) {
+	t.mu.Lock()
+	t.Active = active
+	t.UpdatedAt = time.Now()
+	t.mu.Unlock()
+}
+
+func (t *downloadTask) setOrder(order int64) {
+	t.mu.Lock()
+	t.Order = order
+	t.UpdatedAt = time.Now()
+	t.mu.Unlock()
+}
+
+func (t *downloadTask) sortSnapshot() taskSortSnapshot {
+	t.mu.Lock()
+	snapshot := taskSortSnapshot{
+		id:        t.ID,
+		order:     t.Order,
+		createdAt: t.CreatedAt,
+	}
+	t.mu.Unlock()
+	return snapshot
+}
+
+func reindexTasks(tasks []*downloadTask) {
+	now := time.Now()
+	for i, task := range tasks {
+		if task == nil {
+			continue
+		}
+		task.mu.Lock()
+		task.Order = int64(i + 1)
+		task.UpdatedAt = now
+		task.mu.Unlock()
+	}
+}
+
+func (t *downloadTask) pauseByUser() {
+	if t.torrent != nil {
+		t.torrent.DisallowDataDownload()
+	}
+	t.mu.Lock()
+	t.Active = false
+	t.Paused = true
+	t.Status = "paused"
+	t.Error = ""
+	t.UpdatedAt = time.Now()
+	t.mu.Unlock()
+}
+
+func (t *downloadTask) resumeByUser() {
+	t.mu.Lock()
+	if t.Status != "completed" && t.Status != "stopped" && !t.AwaitingSelection {
+		t.Paused = false
+		if t.torrent != nil && t.torrent.Info() != nil {
+			t.Status = "queued"
+		} else {
+			t.Status = "metadata"
+		}
+		t.Error = ""
+		t.UpdatedAt = time.Now()
+	}
+	t.mu.Unlock()
+}
+
+func (t *downloadTask) stop() {
+	t.stopOnce.Do(func() {
+		close(t.done)
+	})
+}
+
+func (t *downloadTask) isPaused() bool {
+	t.mu.Lock()
+	paused := t.Paused
+	t.mu.Unlock()
+	return paused
+}
+
+func (t *downloadTask) isAwaitingSelection() bool {
+	t.mu.Lock()
+	awaiting := t.AwaitingSelection
+	t.mu.Unlock()
+	return awaiting
+}
+
+func (t *downloadTask) isActive() bool {
+	t.mu.Lock()
+	active := t.Active
+	t.mu.Unlock()
+	return active
+}
+
+func (t *downloadTask) canSchedule() bool {
+	t.mu.Lock()
+	status := t.Status
+	paused := t.Paused
+	awaitingSelection := t.AwaitingSelection
+	torrentReady := t.torrent != nil && t.torrent.Info() != nil
+	t.mu.Unlock()
+	return torrentReady && !paused && !awaitingSelection && status != "completed" && status != "stopped" && status != "metadata_timeout"
+}
+
+func (t *downloadTask) startDownload() {
+	if t.torrent == nil || t.torrent.Info() == nil {
+		return
+	}
+	t.torrent.AllowDataDownload()
+	t.applyFileSelection()
+	t.mu.Lock()
+	t.Active = true
+	t.Paused = false
+	if t.Status != "completed" && t.Status != "stopped" {
+		t.Status = "downloading"
+		t.Error = ""
+	}
+	t.UpdatedAt = time.Now()
+	t.mu.Unlock()
+}
+
+func (t *downloadTask) markAwaitingSelection() {
+	if t.torrent != nil {
+		t.torrent.DisallowDataDownload()
+	}
+	t.mu.Lock()
+	if t.Status != "completed" && t.Status != "stopped" {
+		t.Active = false
+		t.AwaitingSelection = true
+		t.Status = "awaiting_selection"
+		t.Error = ""
+		t.UpdatedAt = time.Now()
+	}
+	t.mu.Unlock()
+}
+
+func (t *downloadTask) hasFileSelectionSet() bool {
+	t.mu.Lock()
+	set := t.fileSelectionSet
+	t.mu.Unlock()
+	return set
+}
+
+func (t *downloadTask) setFileSelection(selection map[string]bool, explicit bool) {
+	t.mu.Lock()
+	if len(selection) == 0 {
+		t.fileSelection = nil
+	} else {
+		t.fileSelection = make(map[string]bool, len(selection))
+		for file := range selection {
+			t.fileSelection[file] = true
+		}
+	}
+	if explicit {
+		t.fileSelectionSet = true
+		t.AwaitingSelection = false
+		if t.Status == "awaiting_selection" {
+			t.Status = "queued"
+		}
+		t.Error = ""
+	}
+	t.UpdatedAt = time.Now()
+	t.mu.Unlock()
+	t.applyFileSelection()
+}
+
+func (t *downloadTask) setFilePriorities(priorities map[string]string, explicit bool) {
+	t.mu.Lock()
+	t.filePriorities = make(map[string]string, len(priorities))
+	t.fileSelection = make(map[string]bool)
+	for file, priority := range priorities {
+		if priority == "" || priority == "skip" {
+			continue
+		}
+		t.filePriorities[file] = priority
+		t.fileSelection[file] = true
+	}
+	if len(t.fileSelection) == 0 {
+		t.fileSelection = nil
+	}
+	if len(t.filePriorities) == 0 {
+		t.filePriorities = nil
+	}
+	if explicit {
+		t.fileSelectionSet = true
+		t.AwaitingSelection = false
+		if t.Status == "awaiting_selection" {
+			t.Status = "queued"
+		}
+		t.Error = ""
+	}
+	t.UpdatedAt = time.Now()
+	t.mu.Unlock()
+	t.applyFileSelection()
+}
+
+func (t *downloadTask) selectedFilesLocked() []string {
+	if len(t.filePriorities) > 0 {
+		files := make([]string, 0, len(t.filePriorities))
+		for file, priority := range t.filePriorities {
+			if priority != "skip" {
+				files = append(files, file)
+			}
+		}
+		sort.Strings(files)
+		return files
+	}
+	if len(t.fileSelection) == 0 {
+		return nil
+	}
+	files := make([]string, 0, len(t.fileSelection))
+	for file, selected := range t.fileSelection {
+		if selected {
+			files = append(files, file)
+		}
+	}
+	sort.Strings(files)
+	return files
+}
+
+func (t *downloadTask) filePrioritiesLocked() map[string]string {
+	if len(t.filePriorities) == 0 {
+		return nil
+	}
+	result := make(map[string]string, len(t.filePriorities))
+	for file, priority := range t.filePriorities {
+		result[file] = priority
+	}
+	return result
+}
+
+func (t *downloadTask) applyFileSelection() {
+	t.mu.Lock()
+	tor := t.torrent
+	selection := make(map[string]bool, len(t.fileSelection))
+	priorities := make(map[string]string, len(t.filePriorities))
+	fileSelectionSet := t.fileSelectionSet
+	for file, selected := range t.fileSelection {
+		selection[file] = selected
+	}
+	for file, priority := range t.filePriorities {
+		priorities[file] = priority
+	}
+	t.mu.Unlock()
+	if tor == nil || tor.Info() == nil {
+		return
+	}
+	files := tor.Files()
+	if !fileSelectionSet {
+		for _, file := range files {
+			if file != nil {
+				file.SetPriority(torrent.PiecePriorityNormal)
+			}
+		}
+		return
+	}
+	if len(selection) == 0 {
+		for _, file := range files {
+			if file != nil {
+				file.SetPriority(torrent.PiecePriorityNone)
+			}
+		}
+		return
+	}
+	for _, file := range files {
+		if file == nil {
+			continue
+		}
+		priority := priorities[file.DisplayPath()]
+		if priority == "" && selection[file.DisplayPath()] {
+			priority = "normal"
+		}
+		switch priority {
+		case "high":
+			file.SetPriority(torrent.PiecePriorityHigh)
+		case "normal":
+			file.SetPriority(torrent.PiecePriorityNormal)
+		default:
+			file.SetPriority(torrent.PiecePriorityNone)
+		}
+	}
+}
+
+func (t *downloadTask) pauseDownload() {
+	if t.torrent != nil {
+		t.torrent.DisallowDataDownload()
+	}
+	t.mu.Lock()
+	t.Active = false
+	if t.Status != "completed" && t.Status != "stopped" && !t.Paused && !t.AwaitingSelection {
+		t.Status = "queued"
+	}
+	t.UpdatedAt = time.Now()
+	t.mu.Unlock()
+}
+
+func (t *downloadTask) markQueued() {
+	t.mu.Lock()
+	if t.Status != "completed" && t.Status != "stopped" && !t.Paused && !t.AwaitingSelection {
+		t.Active = false
+		t.Status = "queued"
+		t.UpdatedAt = time.Now()
+	}
+	t.mu.Unlock()
+}
+
+func (t *downloadTask) filePaths() []string {
+	t.mu.Lock()
+	savePath := t.SavePath
+	tor := t.torrent
+	t.mu.Unlock()
+	if tor == nil || tor.Info() == nil {
+		return nil
+	}
+	files := tor.Files()
+	paths := make([]string, 0, len(files))
+	for _, file := range files {
+		if file == nil {
+			continue
+		}
+		paths = append(paths, filepath.Join(savePath, filepath.FromSlash(file.Path())))
+	}
+	return paths
+}
+
+func (t *downloadTask) filesStatus() []taskFileStatus {
+	_, _, _, files, _ := t.progressSnapshot()
+	return files
+}
+
+func (t *downloadTask) progressSnapshot() (total, completed, missing int64, files []taskFileStatus, metadataReady bool) {
+	t.mu.Lock()
+	tor := t.torrent
+	selection := make(map[string]bool, len(t.fileSelection))
+	customSelection := len(t.fileSelection) > 0
+	fileSelectionSet := t.fileSelectionSet
+	for file, selected := range t.fileSelection {
+		selection[file] = selected
+	}
+	t.mu.Unlock()
+	if tor == nil || tor.Info() == nil {
+		return 0, 0, 0, nil, false
+	}
+	metadataReady = true
+	torrentFiles := tor.Files()
+	result := make([]taskFileStatus, 0, len(torrentFiles))
+	for _, file := range torrentFiles {
+		if file == nil {
+			continue
+		}
+		size := file.Length()
+		fileCompleted := file.BytesCompleted()
+		progress := 0.0
+		if size > 0 {
+			progress = float64(fileCompleted) * 100 / float64(size)
+		}
+		path := file.DisplayPath()
+		selected := true
+		if fileSelectionSet {
+			selected = selection[path]
+		} else if customSelection {
+			selected = selection[path]
+		} else {
+			selected = file.Priority() != torrent.PiecePriorityNone
+		}
+		if file.Priority() == torrent.PiecePriorityNone {
+			selected = false
+		}
+		priority := priorityLabel(file.Priority())
+		result = append(result, taskFileStatus{
+			Path:            path,
+			Size:            size,
+			CompletedBytes:  fileCompleted,
+			ProgressPercent: progress,
+			Selected:        selected,
+			Priority:        priority,
+		})
+		if selected {
+			total += size
+			completed += fileCompleted
+		}
+	}
+	if total == 0 && !fileSelectionSet {
+		total = tor.Length()
+		completed = tor.BytesCompleted()
+	}
+	missing = total - completed
+	if missing < 0 {
+		missing = 0
+	}
+	return total, completed, missing, result, metadataReady
+}
+
+func (t *downloadTask) refreshWithProgress(completed, total, missing int64) (status, name, infoHash, savePath string, createdAt, updatedAt time.Time, errText string, speed float64, progressAt time.Time) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
 	now := time.Now()
+	delta := int64(0)
 	if !t.last.At.IsZero() {
 		elapsed := now.Sub(t.last.At).Seconds()
 		if elapsed > 0 {
-			delta := completed - t.last.Completed
+			delta = completed - t.last.Completed
 			if delta < 0 {
 				delta = 0
 			}
@@ -385,20 +1862,35 @@ func (t *downloadTask) refreshWithProgress(completed int64) (status, name, infoH
 		}
 	}
 	t.last.At = now
+	if delta > 0 || t.last.ProgressAt.IsZero() {
+		t.last.ProgressAt = now
+	}
 	t.last.Completed = completed
 
 	if t.torrent == nil || t.Status == "stopped" {
-		return t.Status, t.Name, t.InfoHash, t.SavePath, t.CreatedAt, t.UpdatedAt, t.Error, t.last.Speed
+		return t.Status, t.Name, t.InfoHash, t.SavePath, t.CreatedAt, t.UpdatedAt, t.Error, t.last.Speed, t.last.ProgressAt
 	}
 	if t.torrent.Info() == nil {
-		t.Status = "metadata"
-	} else if t.torrent.Info() != nil && t.torrent.Length() > 0 && t.torrent.BytesMissing() == 0 {
+		if t.Paused {
+			t.Status = "paused"
+		} else {
+			t.Status = "metadata"
+		}
+	} else if t.AwaitingSelection {
+		t.Status = "awaiting_selection"
+		t.Active = false
+	} else if total > 0 && missing == 0 {
 		t.Status = "completed"
-	} else {
+		t.Active = false
+	} else if t.Active {
 		t.Status = "downloading"
+	} else if t.Paused {
+		t.Status = "paused"
+	} else if t.Status != "metadata_timeout" {
+		t.Status = "queued"
 	}
 	t.UpdatedAt = time.Now()
-	return t.Status, t.Name, t.InfoHash, t.SavePath, t.CreatedAt, t.UpdatedAt, t.Error, t.last.Speed
+	return t.Status, t.Name, t.InfoHash, t.SavePath, t.CreatedAt, t.UpdatedAt, t.Error, t.last.Speed, t.last.ProgressAt
 }
 
 func parseMagnet(raw string) (*metainfo.Magnet, error) {
@@ -416,17 +1908,370 @@ func parseMagnet(raw string) (*metainfo.Magnet, error) {
 	if mi.InfoHash.HexString() == "" {
 		return nil, errors.New("magnet info hash is required")
 	}
+	mi.Trackers = mergeTrackers(mi.Trackers, defaultPublicTrackers)
 	return &mi, nil
 }
 
 func trackers(mi *metainfo.Magnet) []string {
-	result := make([]string, 0, len(mi.Trackers))
-	for _, tr := range mi.Trackers {
-		if tr != "" {
-			result = append(result, tr)
+	return mergeTrackers(mi.Trackers, nil)
+}
+
+func trackerTiers(trackers []string) [][]string {
+	merged := mergeTrackers(trackers, nil)
+	if len(merged) == 0 {
+		return nil
+	}
+	tiers := make([][]string, 0, len(merged))
+	for _, tracker := range merged {
+		tiers = append(tiers, []string{tracker})
+	}
+	return tiers
+}
+
+func mergeTrackers(primary, fallback []string) []string {
+	seen := make(map[string]struct{}, len(primary)+len(fallback))
+	result := make([]string, 0, len(primary)+len(fallback))
+	add := func(raw string) {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			return
 		}
+		parsed, err := url.Parse(raw)
+		if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+			return
+		}
+		key := strings.ToLower(parsed.String())
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
+		result = append(result, raw)
+	}
+	for _, tr := range primary {
+		add(tr)
+	}
+	for _, tr := range fallback {
+		add(tr)
 	}
 	return result
+}
+
+func (m *downloadManager) nextOrder() int64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var maxOrder int64
+	for _, task := range m.tasks {
+		task.mu.Lock()
+		order := task.Order
+		task.mu.Unlock()
+		if order > maxOrder {
+			maxOrder = order
+		}
+	}
+	return maxOrder + 1
+}
+
+func sortTasks(tasks []*downloadTask) {
+	sort.Slice(tasks, func(i, j int) bool {
+		left := tasks[i].sortSnapshot()
+		right := tasks[j].sortSnapshot()
+		if left.order != right.order {
+			if left.order == 0 {
+				return false
+			}
+			if right.order == 0 {
+				return true
+			}
+			return left.order < right.order
+		}
+		if !left.createdAt.Equal(right.createdAt) {
+			return left.createdAt.Before(right.createdAt)
+		}
+		return left.id < right.id
+	})
+}
+
+func persistedTaskOrderLess(left, right persistedTask) bool {
+	if left.Order != right.Order {
+		if left.Order == 0 {
+			return false
+		}
+		if right.Order == 0 {
+			return true
+		}
+		return left.Order < right.Order
+	}
+	if !left.CreatedAt.Equal(right.CreatedAt) {
+		return left.CreatedAt.Before(right.CreatedAt)
+	}
+	return left.ID < right.ID
+}
+
+type taskSortSnapshot struct {
+	id        string
+	order     int64
+	createdAt time.Time
+}
+
+func selectionFromList(files []string) map[string]bool {
+	if len(files) == 0 {
+		return nil
+	}
+	selection := make(map[string]bool, len(files))
+	for _, file := range files {
+		file = strings.TrimSpace(filepath.ToSlash(file))
+		if file != "" {
+			selection[file] = true
+		}
+	}
+	return selection
+}
+
+func prioritiesFromState(files []string, saved map[string]string) map[string]string {
+	priorities := make(map[string]string, len(files)+len(saved))
+	for _, file := range files {
+		file = strings.TrimSpace(filepath.ToSlash(file))
+		if file != "" {
+			priorities[file] = "normal"
+		}
+	}
+	for file, priority := range saved {
+		file = strings.TrimSpace(filepath.ToSlash(file))
+		if file == "" {
+			continue
+		}
+		normalized, err := normalizeFilePriority(priority)
+		if err != nil {
+			continue
+		}
+		priorities[file] = normalized
+	}
+	if len(priorities) == 0 {
+		return nil
+	}
+	return priorities
+}
+
+func normalizeFilePriority(priority string) (string, error) {
+	switch strings.TrimSpace(strings.ToLower(priority)) {
+	case "", "normal", "selected":
+		return "normal", nil
+	case "high":
+		return "high", nil
+	case "skip", "none", "unselected":
+		return "skip", nil
+	default:
+		return "", errors.New("file priority must be high, normal, or skip")
+	}
+}
+
+func priorityLabel(priority torrent.PiecePriority) string {
+	switch priority {
+	case torrent.PiecePriorityHigh:
+		return "high"
+	case torrent.PiecePriorityNone:
+		return "skip"
+	default:
+		return "normal"
+	}
+}
+
+func listenerStrings(addrs []net.Addr) []string {
+	if len(addrs) == 0 {
+		return nil
+	}
+	result := make([]string, 0, len(addrs))
+	for _, addr := range addrs {
+		if addr != nil {
+			result = append(result, addr.String())
+		}
+	}
+	sort.Strings(result)
+	return result
+}
+
+func taskDiagnostic(status string, metadataReady, active, paused, awaitingSelection bool, missing int64, speed float64, metadataAge, stalledSeconds int64, peers, pendingPeers, halfOpenPeers, activePeers, seeders, trackerCount, dhtServers, listenAddrs int) (string, string) {
+	switch {
+	case status == "completed":
+		return "completed", "下载已完成。"
+	case status == "metadata_timeout":
+		return "metadata_timeout", "10 分钟内没有拿到元数据，建议换磁力或刷新发现源。"
+	case paused:
+		return "paused", "任务已暂停。"
+	case awaitingSelection:
+		return "awaiting_selection", "元数据已就绪，正在等待选择文件。"
+	case !metadataReady:
+		if trackerCount == 0 && dhtServers == 0 {
+			return "metadata_no_sources", "正在获取元数据，但没有 Tracker，DHT 也不可用。"
+		}
+		if metadataAge >= 120 && peers == 0 {
+			return "metadata_no_peers", "正在获取元数据，暂时没有发现 Peer。"
+		}
+		return "metadata_searching", "正在通过 DHT/Tracker 获取元数据。"
+	case missing == 0:
+		return "completed", "下载已完成。"
+	case !active:
+		if status == "queued" {
+			return "queued", "任务已就绪，正在等待下载队列空位。"
+		}
+		return "waiting", "任务已就绪，等待调度启动。"
+	case peers == 0:
+		if trackerCount == 0 && dhtServers == 0 {
+			return "no_sources", "没有可用发现源：没有 Tracker，DHT 也不可用。"
+		}
+		return "no_peers", "还没有发现 Peer，通常是资源冷门或网络/DHT/Tracker 受阻。"
+	case activePeers == 0 && halfOpenPeers > 0:
+		return "connecting", "已发现 Peer，正在建立连接。"
+	case activePeers == 0 && pendingPeers > 0:
+		return "pending_peers", "已发现 Peer，但还没有成功连接。"
+	case seeders == 0 && speed < 1:
+		return "no_seeders", "已连接 Peer，但暂时没有可用做种者或对方没有可下载数据。"
+	case speed < 1 && stalledSeconds >= 30:
+		return "stalled", "已连接但 30 秒以上没有下载速度，建议刷新发现源或稍后重试。"
+	case speed < 1:
+		return "warming_up", "已连接 Peer，正在等待数据块响应。"
+	case listenAddrs == 0:
+		return "listen_unavailable", "正在下载，但本机没有监听地址，可能影响被动连接。"
+	default:
+		return "downloading", "下载正常。"
+	}
+}
+
+func safeChildPath(root, path string) (string, error) {
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		return "", err
+	}
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	rel, err := filepath.Rel(absRoot, absPath)
+	if err != nil {
+		return "", err
+	}
+	if rel == "." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || rel == ".." {
+		return "", fmt.Errorf("refuse path outside download directory: %s", absPath)
+	}
+	return absPath, nil
+}
+
+func openLocalPath(path string) error {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return errors.New("path is required")
+	}
+	if _, err := os.Stat(path); err != nil {
+		return err
+	}
+	switch runtime.GOOS {
+	case "darwin":
+		return exec.Command("open", path).Start()
+	case "windows":
+		return exec.Command("rundll32", "url.dll,FileProtocolHandler", path).Start()
+	default:
+		return exec.Command("xdg-open", path).Start()
+	}
+}
+
+func removeEmptyParents(dir, root string) {
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		return
+	}
+	for {
+		absDir, err := filepath.Abs(dir)
+		if err != nil || absDir == absRoot {
+			return
+		}
+		rel, err := filepath.Rel(absRoot, absDir)
+		if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return
+		}
+		if err := os.Remove(absDir); err != nil {
+			return
+		}
+		dir = filepath.Dir(absDir)
+	}
+}
+
+var defaultPublicTrackers = []string{
+	"https://tracker.opentrackr.org:443/announce",
+	"udp://tracker.opentrackr.org:1337/announce",
+	"udp://open.stealth.si:80/announce",
+	"udp://tracker.torrent.eu.org:451/announce",
+	"udp://exodus.desync.com:6969/announce",
+	"udp://open.demonii.com:1337/announce",
+}
+
+var (
+	stateBucket = []byte("state")
+	stateKey    = []byte("snapshot")
+)
+
+func openStateStore(dataDir string) (*stateStore, error) {
+	db, err := bbolt.Open(filepath.Join(dataDir, "bt-go-state.db"), 0o600, &bbolt.Options{
+		Timeout: time.Second,
+	})
+	if err != nil {
+		return nil, err
+	}
+	store := &stateStore{db: db}
+	if err := store.db.Update(func(tx *bbolt.Tx) error {
+		_, err := tx.CreateBucketIfNotExists(stateBucket)
+		return err
+	}); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return store, nil
+}
+
+func (s *stateStore) Close() error {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	return s.db.Close()
+}
+
+func (s *stateStore) load() (persistedState, error) {
+	var state persistedState
+	if s == nil || s.db == nil {
+		state.Settings = defaultAppSettings()
+		return state, nil
+	}
+	err := s.db.View(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket(stateBucket)
+		if bucket == nil {
+			return nil
+		}
+		raw := bucket.Get(stateKey)
+		if len(raw) == 0 {
+			return nil
+		}
+		return json.Unmarshal(raw, &state)
+	})
+	if state.Settings.MaxActiveDownloads < 1 {
+		state.Settings = defaultAppSettings()
+	}
+	return state, err
+}
+
+func (s *stateStore) save(state persistedState) error {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	raw, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return err
+	}
+	return s.db.Update(func(tx *bbolt.Tx) error {
+		bucket, err := tx.CreateBucketIfNotExists(stateBucket)
+		if err != nil {
+			return err
+		}
+		return bucket.Put(stateKey, raw)
+	})
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -445,7 +2290,7 @@ func cors(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-		w.Header().Set("Access-Control-Allow-Methods", "GET,POST,DELETE,OPTIONS")
+		w.Header().Set("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -520,7 +2365,7 @@ const indexHTML = `<!doctype html>
         linear-gradient(180deg, #f7f9fc 0%, var(--bg) 58%, #e9eef4 100%);
       color: var(--text);
     }
-    button, textarea { font: inherit; }
+    button, textarea, input, select { font: inherit; }
     button {
       height: 42px;
       padding: 0 16px;
@@ -539,6 +2384,44 @@ const indexHTML = `<!doctype html>
     button.secondary:hover { background: #263142; box-shadow: 0 8px 18px rgba(53, 65, 85, .16); }
     button.danger { height: 34px; padding: 0 12px; background: #fff; color: var(--red); border: 1px solid #f0c5bf; }
     button.danger:hover { background: #fff4f2; box-shadow: none; }
+    button.compact { height: 32px; padding: 0 10px; font-size: 12px; }
+    input[type="number"], input[type="file"], input[type="search"], select {
+      width: 100%;
+      height: 42px;
+      padding: 0 11px;
+      border: 1px solid #cbd3df;
+      border-radius: 7px;
+      background: #fff;
+      color: var(--text);
+      outline: none;
+    }
+    input[type="file"] { padding-top: 8px; }
+    select {
+      appearance: none;
+      background-image:
+        linear-gradient(45deg, transparent 50%, #657083 50%),
+        linear-gradient(135deg, #657083 50%, transparent 50%);
+      background-position:
+        calc(100% - 16px) 50%,
+        calc(100% - 11px) 50%;
+      background-size: 5px 5px, 5px 5px;
+      background-repeat: no-repeat;
+      padding-right: 30px;
+    }
+    .check-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-height: 42px;
+      color: var(--text);
+      font-size: 13px;
+      font-weight: 700;
+    }
+    .check-row input { width: 16px; height: 16px; }
+    input:focus, select:focus {
+      border-color: var(--blue);
+      box-shadow: 0 0 0 3px rgba(29, 102, 209, .12);
+    }
     main {
       width: min(1180px, calc(100% - 32px));
       margin: 0 auto;
@@ -590,6 +2473,17 @@ const indexHTML = `<!doctype html>
       padding: 16px;
       margin-bottom: 16px;
     }
+    .settings {
+      padding: 14px 16px;
+      margin-bottom: 16px;
+    }
+    .settings-grid {
+      display: grid;
+      grid-template-columns: minmax(140px, 1fr) minmax(160px, 1fr) minmax(180px, auto) auto;
+      gap: 12px;
+      align-items: end;
+    }
+    label { display: block; color: var(--muted); font-size: 12px; font-weight: 750; margin-bottom: 6px; }
     .composer-grid {
       display: grid;
       grid-template-columns: minmax(0, 1fr) auto;
@@ -618,6 +2512,13 @@ const indexHTML = `<!doctype html>
       gap: 8px;
       min-width: 112px;
     }
+    .file-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 12px;
+      align-items: center;
+      margin-top: 12px;
+    }
     .message {
       min-height: 20px;
       margin: 10px 2px 0;
@@ -638,6 +2539,16 @@ const indexHTML = `<!doctype html>
     }
     .table-head strong { font-size: 15px; }
     .table-head span { color: var(--muted); font-size: 13px; }
+    .table-tools { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+    .table-tools input[type="search"], .table-tools select {
+      width: auto;
+      min-width: 128px;
+      height: 32px;
+      font-size: 12px;
+      font-weight: 700;
+      background-color: #fff;
+    }
+    .table-tools input[type="search"] { min-width: 190px; }
     table {
       width: 100%;
       border-collapse: collapse;
@@ -659,7 +2570,8 @@ const indexHTML = `<!doctype html>
     th.name-col { width: 34%; }
     th.progress-col { width: 20%; }
     th.small-col { width: 11%; }
-    th.action-col { width: 74px; }
+    th.action-col { width: 250px; }
+    .task-actions { display: flex; flex-wrap: wrap; gap: 6px; }
     tbody tr:hover { background: #fbfdff; }
     .task-name {
       display: block;
@@ -690,7 +2602,7 @@ const indexHTML = `<!doctype html>
     }
     .pill.completed { background: #eaf7ef; color: var(--green); }
     .pill.metadata, .pill.metadata_timeout { background: #fff4df; color: var(--amber); }
-    .pill.stopped { background: #f1f3f6; color: #596273; }
+    .pill.paused, .pill.stopped { background: #f1f3f6; color: #596273; }
     .bar {
       height: 9px;
       background: #e7ecf3;
@@ -708,6 +2620,36 @@ const indexHTML = `<!doctype html>
     .progress-text { margin-top: 6px; color: var(--muted); font-size: 12px; }
     .metric { font-weight: 760; }
     .muted { color: var(--muted); font-size: 12px; }
+    .file-detail-cell { padding: 0 12px 14px; background: #fbfcfe; }
+    .file-panel {
+      border: 1px solid #e1e6ee;
+      border-radius: 8px;
+      background: #fff;
+      padding: 10px;
+    }
+    .file-panel-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 8px;
+    }
+    .file-panel-head strong { font-size: 13px; }
+    .file-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+    .file-list { display: grid; gap: 6px; }
+    .file-item {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 106px auto auto;
+      gap: 8px;
+      align-items: center;
+      padding: 8px;
+      border: 1px solid #edf0f5;
+      border-radius: 7px;
+      background: #fff;
+    }
+    .file-item select { height: 32px; font-size: 12px; font-weight: 700; }
+    .file-name { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; font-weight: 700; }
+    .file-meta { color: var(--muted); font-size: 12px; margin-top: 3px; }
     .empty {
       padding: 42px 16px;
       text-align: center;
@@ -718,9 +2660,11 @@ const indexHTML = `<!doctype html>
       main { width: min(100% - 20px, 720px); padding-top: 16px; }
       .topbar { align-items: stretch; flex-direction: column; }
       .summary { min-width: 0; grid-template-columns: repeat(3, minmax(0, 1fr)); }
+      .settings-grid { grid-template-columns: 1fr; }
       .composer-grid { grid-template-columns: 1fr; }
       .actions { flex-direction: row; min-width: 0; }
       .actions button { flex: 1; }
+      .file-row { grid-template-columns: 1fr; }
       table, thead, tbody, th, td, tr { display: block; }
       thead { display: none; }
       tbody { padding: 8px; display: block; }
@@ -761,13 +2705,51 @@ const indexHTML = `<!doctype html>
         <button class="secondary" onclick="loadTasks()">刷新</button>
       </div>
     </div>
+    <div class="file-row">
+      <input id="torrentFile" type="file" accept=".torrent,application/x-bittorrent">
+      <button class="secondary" onclick="uploadTorrent()">上传 torrent</button>
+    </div>
     <div id="message" class="message"></div>
+  </section>
+
+  <section class="panel settings">
+    <div class="settings-grid">
+      <div>
+        <label for="maxActive">同时下载任务</label>
+        <input id="maxActive" type="number" min="1" max="50" step="1" value="3">
+      </div>
+      <div>
+        <label for="rateLimit">最大下载速度 MB/s</label>
+        <input id="rateLimit" type="number" min="0" step="0.1" value="0">
+      </div>
+      <label class="check-row">
+        <input id="waitForFiles" type="checkbox">
+        <span>解析后先选文件</span>
+      </label>
+      <button onclick="saveSettings()">保存设置</button>
+    </div>
   </section>
 
   <section class="panel tasks-panel">
     <div class="table-head">
       <strong>下载任务</strong>
-      <span id="lastRefresh">等待刷新</span>
+      <div class="table-tools">
+        <input id="taskSearch" type="search" placeholder="搜索任务" oninput="loadTasks()">
+        <select id="taskFilter" onchange="loadTasks()">
+          <option value="all">全部状态</option>
+          <option value="downloading">下载中</option>
+          <option value="queued">排队中</option>
+          <option value="awaiting_selection">等待选文件</option>
+          <option value="metadata">获取元数据</option>
+          <option value="paused">已暂停</option>
+          <option value="completed">已完成</option>
+          <option value="metadata_timeout">元数据超时</option>
+        </select>
+        <button class="secondary compact" onclick="openDownloadDir()">打开目录</button>
+        <button class="secondary compact" onclick="pauseAllTasks()">全部暂停</button>
+        <button class="secondary compact" onclick="resumeAllTasks()">全部继续</button>
+        <span id="lastRefresh">等待刷新</span>
+      </div>
     </div>
     <table>
       <thead>
@@ -794,8 +2776,26 @@ const fmtBytes = n => {
   return n.toFixed(i ? 2 : 0) + " " + units[i];
 };
 
+const fmtDuration = seconds => {
+  seconds = Math.max(0, Math.floor(seconds || 0));
+  if (seconds < 60) return seconds + " 秒";
+  const minutes = Math.floor(seconds / 60);
+  const rest = seconds % 60;
+  if (minutes < 60) return minutes + " 分 " + rest + " 秒";
+  const hours = Math.floor(minutes / 60);
+  return hours + " 小时 " + (minutes % 60) + " 分";
+};
+
+const fmtETA = seconds => seconds ? fmtDuration(seconds) : "计算中";
+const bytesToMB = bytes => Math.round((bytes || 0) / 1024 / 1024 * 10) / 10;
+const mbToBytes = mb => Math.max(0, Math.round((Number(mb) || 0) * 1024 * 1024));
+const expandedFiles = new Set();
+
 const statusText = status => ({
   metadata: "获取元数据",
+  awaiting_selection: "等待选文件",
+  queued: "排队中",
+  paused: "已暂停",
   metadata_timeout: "元数据超时",
   downloading: "下载中",
   completed: "已完成",
@@ -851,23 +2851,284 @@ async function addTask() {
   }
 }
 
-async function deleteTask(id) {
-  await fetch("/api/tasks/" + encodeURIComponent(id), {method: "DELETE"});
+async function uploadTorrent() {
+  const input = document.getElementById("torrentFile");
+  const file = input.files && input.files[0];
+  if (!file) {
+    setMessage("请先选择 torrent 文件", "err");
+    return;
+  }
+  const form = new FormData();
+  form.append("file", file);
+  setMessage("正在解析 torrent 文件...");
+  try {
+    const res = await fetch("/api/torrents", {
+      method: "POST",
+      body: form
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      setMessage(data.error || "上传失败", "err");
+      return;
+    }
+    input.value = "";
+    setMessage("已添加任务：" + data.infoHash, "ok");
+    await loadTasks();
+  } catch (err) {
+    setMessage("上传失败：" + err.message, "err");
+  }
+}
+
+async function loadSettings() {
+  try {
+    const res = await fetch("/api/settings");
+    const settings = await res.json();
+    document.getElementById("maxActive").value = settings.maxActiveDownloads || 3;
+    document.getElementById("rateLimit").value = bytesToMB(settings.downloadRateLimitBytes);
+    document.getElementById("waitForFiles").checked = !!settings.waitForFileSelection;
+  } catch (err) {
+    setMessage("读取设置失败：" + err.message, "err");
+  }
+}
+
+async function saveSettings() {
+  const maxActive = Math.max(1, Math.min(50, parseInt(document.getElementById("maxActive").value, 10) || 1));
+  const rateLimit = mbToBytes(document.getElementById("rateLimit").value);
+  const waitForFileSelection = document.getElementById("waitForFiles").checked;
+  try {
+    const res = await fetch("/api/settings", {
+      method: "PUT",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        maxActiveDownloads: maxActive,
+        downloadRateLimitBytes: rateLimit,
+        waitForFileSelection
+      })
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      setMessage(data.error || "设置保存失败", "err");
+      return;
+    }
+    setMessage(rateLimit ? "已限制为 " + fmtBytes(rateLimit) + "/s" : "已设置为不限速", "ok");
+    await loadTasks();
+  } catch (err) {
+    setMessage("设置保存失败：" + err.message, "err");
+  }
+}
+
+async function pauseTask(id) {
+  const res = await fetch("/api/tasks/" + encodeURIComponent(id) + "/pause", {method: "POST"});
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    setMessage(data.error || "暂停失败", "err");
+  }
   await loadTasks();
 }
 
-function renderEmpty(tbody) {
+async function resumeTask(id) {
+  const res = await fetch("/api/tasks/" + encodeURIComponent(id) + "/resume", {method: "POST"});
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    setMessage(data.error || "继续失败", "err");
+  }
+  await loadTasks();
+}
+
+async function pauseAllTasks() {
+  const res = await fetch("/api/tasks/pause-all", {method: "POST"});
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    setMessage(data.error || "全部暂停失败", "err");
+  }
+  await loadTasks();
+}
+
+async function resumeAllTasks() {
+  const res = await fetch("/api/tasks/resume-all", {method: "POST"});
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    setMessage(data.error || "全部继续失败", "err");
+  }
+  await loadTasks();
+}
+
+async function moveTask(id, direction) {
+  const res = await fetch("/api/tasks/" + encodeURIComponent(id) + "/move", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({direction})
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    setMessage(data.error || "调整顺序失败", "err");
+  }
+  await loadTasks();
+}
+
+async function refreshDiscovery(id) {
+  const res = await fetch("/api/tasks/" + encodeURIComponent(id) + "/refresh-discovery", {method: "POST"});
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    setMessage(data.error || "刷新发现源失败", "err");
+    return;
+  }
+  setMessage("已刷新 Tracker/DHT 发现源", "ok");
+  await loadTasks();
+}
+
+async function deleteTask(id, deleteFiles) {
+  const suffix = deleteFiles ? "?deleteFiles=true" : "";
+  const res = await fetch("/api/tasks/" + encodeURIComponent(id) + suffix, {method: "DELETE"});
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    setMessage(data.error || "删除失败", "err");
+  }
+  await loadTasks();
+}
+
+async function openDownloadDir() {
+  const res = await fetch("/api/open-download-dir", {method: "POST"});
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    setMessage(data.error || "打开下载目录失败", "err");
+    return;
+  }
+  setMessage("已请求系统打开下载目录", "ok");
+}
+
+async function openTaskPath(id, path) {
+  const res = await fetch("/api/tasks/" + encodeURIComponent(id) + "/open", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({path: path || ""})
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    setMessage(data.error || "打开路径失败", "err");
+    return;
+  }
+  setMessage("已请求系统打开路径", "ok");
+}
+
+async function saveFileSelection(id) {
+  const priorities = {};
+  document.querySelectorAll('[data-file-priority-task="' + CSS.escape(id) + '"]').forEach(select => {
+    priorities[select.dataset.filePath] = select.value;
+  });
+  const res = await fetch("/api/tasks/" + encodeURIComponent(id) + "/files", {
+    method: "PUT",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({priorities})
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    setMessage(data.error || "文件优先级保存失败", "err");
+    return;
+  }
+  setMessage("已保存文件优先级", "ok");
+  await loadTasks();
+}
+
+function setTaskFilePriority(id, priority) {
+  document.querySelectorAll('[data-file-priority-task="' + CSS.escape(id) + '"]').forEach(select => {
+    select.value = priority;
+  });
+}
+
+function renderEmpty(tbody, filtered) {
   const tr = document.createElement("tr");
   const td = document.createElement("td");
   td.colSpan = 7;
   const empty = document.createElement("div");
   empty.className = "empty";
   const title = document.createElement("strong");
-  title.textContent = "暂无下载任务";
+  title.textContent = filtered ? "没有匹配任务" : "暂无下载任务";
   const desc = document.createElement("span");
-  desc.textContent = "粘贴磁力链接后会在这里显示进度、速度和 Peer 状态";
+  desc.textContent = filtered ? "调整搜索词或状态筛选后再试" : "粘贴磁力链接后会在这里显示进度、速度和 Peer 状态";
   empty.append(title, desc);
   td.appendChild(empty);
+  tr.appendChild(td);
+  tbody.appendChild(tr);
+}
+
+function renderTaskFiles(tbody, task) {
+  if (!task.files || !task.files.length) return;
+  const tr = document.createElement("tr");
+  tr.id = "files-" + task.id;
+  tr.hidden = !expandedFiles.has(task.id);
+  const td = document.createElement("td");
+  td.colSpan = 7;
+  td.className = "file-detail-cell";
+
+  const panel = document.createElement("div");
+  panel.className = "file-panel";
+  const head = document.createElement("div");
+  head.className = "file-panel-head";
+  const title = document.createElement("strong");
+  const selectedCount = task.files.filter(file => file.selected).length;
+  title.textContent = "文件 " + selectedCount + "/" + task.files.length;
+  const fileActions = document.createElement("div");
+  fileActions.className = "file-actions";
+  const all = document.createElement("button");
+  all.className = "secondary compact";
+  all.textContent = "全部普通";
+  all.onclick = () => setTaskFilePriority(task.id, "normal");
+  const high = document.createElement("button");
+  high.className = "secondary compact";
+  high.textContent = "全部高";
+  high.onclick = () => setTaskFilePriority(task.id, "high");
+  const none = document.createElement("button");
+  none.className = "secondary compact";
+  none.textContent = "全部跳过";
+  none.onclick = () => setTaskFilePriority(task.id, "skip");
+  const save = document.createElement("button");
+  save.className = "compact";
+  save.textContent = "保存优先级";
+  save.onclick = () => saveFileSelection(task.id);
+  fileActions.append(all, high, none, save);
+  head.append(title, fileActions);
+
+  const list = document.createElement("div");
+  list.className = "file-list";
+  task.files.forEach(file => {
+    const row = document.createElement("div");
+    row.className = "file-item";
+    const info = document.createElement("div");
+    const name = document.createElement("span");
+    name.className = "file-name";
+    name.textContent = file.path;
+    const meta = document.createElement("div");
+    meta.className = "file-meta";
+    meta.textContent = fmtBytes(file.completedBytes) + " / " + fmtBytes(file.size) + " · " + Math.max(0, Math.min(100, file.progressPercent || 0)).toFixed(2) + "%";
+    info.append(name, meta);
+    const select = document.createElement("select");
+    select.dataset.filePriorityTask = task.id;
+    select.dataset.filePath = file.path;
+    select.value = file.priority === "high" ? "high" : (file.selected ? "normal" : "skip");
+    [
+      ["high", "高"],
+      ["normal", "普通"],
+      ["skip", "跳过"]
+    ].forEach(([value, label]) => {
+      const option = document.createElement("option");
+      option.value = value;
+      option.textContent = label;
+      select.appendChild(option);
+    });
+    const state = document.createElement("span");
+    state.className = "muted";
+    state.textContent = file.priority === "high" ? "高优先级" : (file.selected ? "下载" : "跳过");
+    const open = document.createElement("button");
+    open.className = "secondary compact";
+    open.textContent = "打开";
+    open.onclick = () => openTaskPath(task.id, file.path);
+    row.append(info, select, state, open);
+    list.appendChild(row);
+  });
+
+  panel.append(head, list);
+  td.appendChild(panel);
   tr.appendChild(td);
   tbody.appendChild(tr);
 }
@@ -891,8 +3152,28 @@ function renderTask(tbody, task) {
   pill.textContent = statusText(task.status);
   const meta = document.createElement("div");
   meta.className = "muted";
-  meta.textContent = task.metadataReady ? "metadata ready" : "metadata pending";
-  statusWrap.append(pill, meta);
+  if (task.paused) {
+    meta.textContent = task.metadataReady ? "已暂停文件下载" : "已暂停下载调度";
+  } else if (task.awaitingSelection) {
+    meta.textContent = "展开文件后保存选择";
+  } else if (!task.metadataReady) {
+    meta.textContent = "DHT/Tracker 查找中 " + fmtDuration(task.metadataAgeSeconds);
+  } else if (task.queued) {
+    meta.textContent = "排队位置 " + task.queuePosition;
+  } else {
+    meta.textContent = task.active ? "正在拉取数据" : "等待调度";
+  }
+  const tracker = document.createElement("div");
+  tracker.className = "muted";
+  if (task.stalled) {
+    tracker.textContent = task.diagnostic || ("可能卡住 " + fmtDuration(task.stalledSeconds));
+  } else {
+    tracker.textContent = task.diagnostic || ((task.source || "magnet") + " · trackers " + (task.trackerCount || 0));
+  }
+  const discovery = document.createElement("div");
+  discovery.className = "muted";
+  discovery.textContent = "源 " + (task.source || "magnet") + " · Tracker " + (task.trackerCount || 0) + " · DHT " + (task.dhtEnabled ? task.dhtServers : 0);
+  statusWrap.append(pill, meta, tracker, discovery);
   tr.appendChild(cell("状态", statusWrap));
 
   const progressWrap = document.createElement("div");
@@ -903,7 +3184,7 @@ function renderTask(tbody, task) {
   bar.appendChild(fill);
   const progressText = document.createElement("div");
   progressText.className = "progress-text";
-  progressText.textContent = pct.toFixed(2) + "%";
+  progressText.textContent = pct.toFixed(2) + "% · ETA " + fmtETA(task.etaSeconds);
   progressWrap.append(bar, progressText);
   tr.appendChild(cell("进度", progressWrap));
 
@@ -915,7 +3196,7 @@ function renderTask(tbody, task) {
   const peers = document.createElement("div");
   peers.innerHTML = "<strong></strong><br><span class=\"muted\"></span>";
   peers.querySelector("strong").textContent = (task.activePeers || 0) + "/" + (task.peers || 0);
-  peers.querySelector("span").textContent = "seeders " + (task.seeders || 0);
+  peers.querySelector("span").textContent = "known " + (task.knownPeers || 0) + " · seeders " + (task.seeders || 0) + " · pending " + (task.pendingPeers || 0) + " · half " + (task.halfOpenPeers || 0);
   tr.appendChild(cell("Peer", peers));
 
   const size = document.createElement("div");
@@ -923,32 +3204,123 @@ function renderTask(tbody, task) {
   size.textContent = fmtBytes(task.completedBytes) + " / " + fmtBytes(task.totalBytes);
   tr.appendChild(cell("大小", size));
 
-  const btn = document.createElement("button");
-  btn.className = "danger";
-  btn.textContent = "停止";
-  btn.onclick = () => deleteTask(task.id);
-  tr.appendChild(cell("", btn));
+  const actions = document.createElement("div");
+  actions.className = "task-actions";
+  if (task.status !== "completed" && task.status !== "stopped") {
+    const toggle = document.createElement("button");
+    toggle.className = "secondary compact";
+    toggle.textContent = task.paused ? "继续" : "暂停";
+    toggle.onclick = () => task.paused ? resumeTask(task.id) : pauseTask(task.id);
+    actions.appendChild(toggle);
+  }
+  const open = document.createElement("button");
+  open.className = "secondary compact";
+  open.textContent = "打开";
+  open.onclick = () => openTaskPath(task.id, "");
+  actions.appendChild(open);
+  const refresh = document.createElement("button");
+  refresh.className = "secondary compact";
+  refresh.textContent = "刷新源";
+  refresh.onclick = () => refreshDiscovery(task.id);
+  actions.appendChild(refresh);
+  const remove = document.createElement("button");
+  remove.className = "danger compact";
+  remove.textContent = "移除";
+  remove.onclick = () => deleteTask(task.id, false);
+  actions.appendChild(remove);
+  const top = document.createElement("button");
+  top.className = "secondary compact";
+  top.textContent = "置顶";
+  top.onclick = () => moveTask(task.id, "top");
+  actions.appendChild(top);
+  const up = document.createElement("button");
+  up.className = "secondary compact";
+  up.textContent = "上移";
+  up.onclick = () => moveTask(task.id, "up");
+  actions.appendChild(up);
+  const down = document.createElement("button");
+  down.className = "secondary compact";
+  down.textContent = "下移";
+  down.onclick = () => moveTask(task.id, "down");
+  actions.appendChild(down);
+  const bottom = document.createElement("button");
+  bottom.className = "secondary compact";
+  bottom.textContent = "底部";
+  bottom.onclick = () => moveTask(task.id, "bottom");
+  actions.appendChild(bottom);
+  if (task.files && task.files.length) {
+    const files = document.createElement("button");
+    files.className = "secondary compact";
+    files.textContent = "文件";
+    files.onclick = () => {
+      const row = document.getElementById("files-" + task.id);
+      if (!row) return;
+      row.hidden = !row.hidden;
+      if (row.hidden) {
+        expandedFiles.delete(task.id);
+      } else {
+        expandedFiles.add(task.id);
+      }
+    };
+    actions.appendChild(files);
+  }
+  const removeFiles = document.createElement("button");
+  removeFiles.className = "danger compact";
+  removeFiles.textContent = "删文件";
+  removeFiles.onclick = () => {
+    if (confirm("确认移除任务并删除已下载文件？")) {
+      deleteTask(task.id, true);
+    }
+  };
+  actions.appendChild(removeFiles);
+  tr.appendChild(cell("操作", actions));
 
   tbody.appendChild(tr);
+  renderTaskFiles(tbody, task);
+}
+
+function filteredTasks(tasks) {
+  const search = (document.getElementById("taskSearch")?.value || "").trim().toLowerCase();
+  const filter = document.getElementById("taskFilter")?.value || "all";
+  return tasks.filter(task => {
+    if (filter !== "all" && task.status !== filter) {
+      return false;
+    }
+    if (!search) {
+      return true;
+    }
+    const fileText = (task.files || []).map(file => file.path).join(" ");
+    const haystack = [
+      task.name,
+      task.infoHash,
+      task.id,
+      task.status,
+      task.source,
+      fileText
+    ].filter(Boolean).join(" ").toLowerCase();
+    return haystack.includes(search);
+  });
 }
 
 async function loadTasks() {
   try {
     const res = await fetch("/api/tasks");
     const tasks = await res.json();
+    const visibleTasks = filteredTasks(tasks);
     const tbody = document.getElementById("tasks");
     tbody.innerHTML = "";
     renderSummary(tasks);
-    if (!tasks.length) {
-      renderEmpty(tbody);
+    if (!visibleTasks.length) {
+      renderEmpty(tbody, tasks.length > 0);
       return;
     }
-    tasks.forEach(task => renderTask(tbody, task));
+    visibleTasks.forEach(task => renderTask(tbody, task));
   } catch (err) {
     setMessage("刷新失败：" + err.message, "err");
   }
 }
 
+loadSettings();
 loadTasks();
 setInterval(loadTasks, 2000);
 </script>

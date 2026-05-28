@@ -4,6 +4,18 @@
 
 It uses `github.com/anacrolix/torrent` for BitTorrent protocol handling. The service does not set a download speed limit; actual speed depends on your bandwidth, peer/seed availability, tracker/DHT reachability, NAT/firewall, ISP policy and disk I/O.
 
+The app runs each task with its own watcher goroutine while the torrent library handles DHT,
+tracker announces, peer connections, and piece requests internally. Runtime settings let you cap
+how many tasks actively download file data at the same time and optionally apply a global download
+rate limit. Set the rate limit to `0` for unlimited speed.
+
+Tasks and settings are persisted in `bt-go-state.db` under the download directory. Restarting the
+service restores the saved magnet tasks and runtime settings, then resumes metadata lookup or file
+downloading according to the active-download queue.
+
+Metadata-ready tasks expose file-level progress. Multi-file torrents can be narrowed to selected
+files without adding accounts, login, or any remote service.
+
 ## Can Users Run It Directly?
 
 There are two ways to publish this project:
@@ -84,11 +96,16 @@ Windows output:
 
 ```text
 bin/bt-go-desktop-windows-amd64.exe
+dist/bt-go-desktop-windows-amd64.zip
+dist/bt-go-desktop-windows-amd64.zip.sha256
 ```
 
 The Windows desktop build starts the same local download service on a random `127.0.0.1` port and opens Microsoft Edge in app-window mode. If Edge app mode is unavailable, it falls back to opening the default browser. Windows 10 and Windows 11 should keep Microsoft Edge or Microsoft WebView2 Runtime installed.
 
 For better speed, allow inbound TCP and UDP on the BitTorrent listen port in your firewall/router.
+
+GitHub Actions release packaging is available in `.github/workflows/release.yml`. Push a tag like
+`v0.1.0` or run the workflow manually to build zipped desktop artifacts and SHA256 files.
 
 ## API
 
@@ -108,6 +125,13 @@ curl -s http://127.0.0.1:8088/api/tasks \
   -d '{"magnet":"magnet:?xt=urn:btih:..."}'
 ```
 
+Upload a `.torrent` file and start it as a download task:
+
+```bash
+curl -s http://127.0.0.1:8088/api/torrents \
+  -F 'file=@ubuntu-26.04-desktop-amd64.iso.torrent;type=application/x-bittorrent'
+```
+
 List tasks:
 
 ```bash
@@ -120,16 +144,132 @@ Get one task:
 curl -s http://127.0.0.1:8088/api/tasks/{infoHash}
 ```
 
-Stop and remove a task from memory:
+Pause or resume a task:
+
+```bash
+curl -X POST http://127.0.0.1:8088/api/tasks/{infoHash}/pause
+curl -X POST http://127.0.0.1:8088/api/tasks/{infoHash}/resume
+```
+
+Pause or resume all tasks:
+
+```bash
+curl -X POST http://127.0.0.1:8088/api/tasks/pause-all
+curl -X POST http://127.0.0.1:8088/api/tasks/resume-all
+```
+
+Move a task in the queue:
+
+```bash
+curl -s -X POST http://127.0.0.1:8088/api/tasks/{infoHash}/move \
+  -H 'Content-Type: application/json' \
+  -d '{"direction":"top"}'
+```
+
+`direction` can be `top`, `up`, `down`, or `bottom`.
+
+Refresh task discovery sources:
+
+```bash
+curl -X POST http://127.0.0.1:8088/api/tasks/{infoHash}/refresh-discovery
+```
+
+This re-adds the task trackers and starts a short DHT announce pass. It is useful when a task has
+metadata but no active peers, or when it sits at `0 B/s` for a while.
+
+Select files in a metadata-ready task:
+
+```bash
+curl -s -X PUT http://127.0.0.1:8088/api/tasks/{infoHash}/files \
+  -H 'Content-Type: application/json' \
+  -d '{"files":["video.mp4","subtitle.srt"]}'
+```
+
+Set file priorities in a metadata-ready task:
+
+```bash
+curl -s -X PUT http://127.0.0.1:8088/api/tasks/{infoHash}/files \
+  -H 'Content-Type: application/json' \
+  -d '{"priorities":{"video.mp4":"high","sample.txt":"skip","subtitle.srt":"normal"}}'
+```
+
+Priority values are `high`, `normal`, and `skip`. The older `files` list is still accepted and is
+treated as `normal` priority for the listed files. Send an empty file list or an empty priority map
+to skip all files until another selection is saved.
+
+Open the download directory or a task/file path on the local machine:
+
+```bash
+curl -X POST http://127.0.0.1:8088/api/open-download-dir
+curl -s -X POST http://127.0.0.1:8088/api/tasks/{infoHash}/open \
+  -H 'Content-Type: application/json' \
+  -d '{"path":"video.mp4"}'
+```
+
+The open endpoint only accepts paths belonging to the task and refuses paths outside the configured
+download directory.
+
+Remove a task from memory and the persisted task list:
 
 ```bash
 curl -X DELETE http://127.0.0.1:8088/api/tasks/{infoHash}
 ```
+
+Deleting a task also removes it from the local persisted task list. Existing downloaded files are
+not deleted unless `deleteFiles=true` is set:
+
+```bash
+curl -X DELETE 'http://127.0.0.1:8088/api/tasks/{infoHash}?deleteFiles=true'
+```
+
+Read runtime settings:
+
+```bash
+curl -s http://127.0.0.1:8088/api/settings
+```
+
+Update runtime settings:
+
+```bash
+curl -s -X PUT http://127.0.0.1:8088/api/settings \
+  -H 'Content-Type: application/json' \
+  -d '{"maxActiveDownloads":3,"downloadRateLimitBytes":0,"waitForFileSelection":false}'
+```
+
+`maxActiveDownloads` controls how many metadata-ready tasks actively pull file data. Metadata
+lookup may still run for queued magnet tasks so they can be ready when a slot opens.
+`downloadRateLimitBytes` is a global byte-per-second cap. Use `0` for unlimited.
+`waitForFileSelection` keeps metadata-ready tasks in `awaiting_selection` until a file selection is
+saved, which is useful for multi-file torrents.
+
+Settings are persisted automatically after updates.
+
+Task status includes `diagnostic`, `diagnosticCode`, `dhtEnabled`, `dhtServers`, `listenAddrs`,
+`knownPeers`, `etaSeconds`, `stalled`, `stalledSeconds`, and `files` when metadata is ready. The
+diagnostic fields explain whether a task is waiting for metadata, has no peers, is connecting to
+peers, has no seeders, is stalled, or is downloading normally. The aggregate size/progress is
+calculated from the selected files, so skipped files do not inflate the ETA.
+
+## Verification
+
+Local checks run with Go 1.26.3:
+
+```bash
+GOTOOLCHAIN=go1.26.3 go test ./...
+GOTOOLCHAIN=go1.26.3 go test -tags desktop ./...
+GOTOOLCHAIN=go1.26.3 go vet ./...
+GOTOOLCHAIN=go1.26.3 go vet -tags desktop ./...
+```
+
+Live HTTP verification was also run against the official Ubuntu 26.04 torrent file. With
+`maxActiveDownloads=1` and `downloadRateLimitBytes=1048576`, the task entered `downloading`, found
+438 peers with 33 active seeders, and reported about `879814 B/s` during the short test window.
+The temporary task, service, and download directory were removed after verification.
 
 ## Notes
 
 - This is a local prototype, not a public production service.
 - Do not expose it directly to the internet without authentication and access control.
 - Only download content you have the legal right to download.
-- Tasks are kept in memory. Restarting the service clears the task list, but downloaded files remain in the download directory.
-- The current version does not cap download speed. It also does not disable upload because BitTorrent health and download speed usually depend on sharing with peers.
+- Tasks and settings are persisted locally in the download directory.
+- Upload is not disabled because BitTorrent health and download speed usually depend on sharing with peers.
