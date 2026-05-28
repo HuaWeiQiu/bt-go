@@ -226,7 +226,6 @@ func (m *downloadManager) add(magnet string) (*downloadTask, error) {
 	if err != nil {
 		return nil, fmt.Errorf("add magnet: %w", err)
 	}
-	t.DownloadAll()
 
 	now := time.Now()
 	task := &downloadTask{
@@ -296,9 +295,11 @@ func (m *downloadManager) status(task *downloadTask) taskStatus {
 		activePeers = stats.ActivePeers
 		seeders = stats.ConnectedSeeders
 		metadataReady = task.torrent.Info() != nil
-		total = task.torrent.Length()
-		completed = task.torrent.BytesCompleted()
-		missing = task.torrent.BytesMissing()
+		if metadataReady {
+			total = task.torrent.Length()
+			completed = task.torrent.BytesCompleted()
+			missing = task.torrent.BytesMissing()
+		}
 	}
 
 	status, name, infoHash, savePath, createdAt, updatedAt, errText, speed := task.refreshWithProgress(completed)
@@ -334,6 +335,7 @@ func (m *downloadManager) watch(task *downloadTask) {
 	case <-task.torrent.GotInfo():
 		task.setName(task.torrent.Name())
 		task.setState("downloading", "")
+		task.torrent.DownloadAll()
 	case <-time.After(10 * time.Minute):
 		task.setState("metadata_timeout", "metadata not found within 10 minutes")
 		return
@@ -390,7 +392,7 @@ func (t *downloadTask) refreshWithProgress(completed int64) (status, name, infoH
 	}
 	if t.torrent.Info() == nil {
 		t.Status = "metadata"
-	} else if t.torrent.Length() > 0 && t.torrent.BytesMissing() == 0 {
+	} else if t.torrent.Info() != nil && t.torrent.Length() > 0 && t.torrent.BytesMissing() == 0 {
 		t.Status = "completed"
 	} else {
 		t.Status = "downloading"
@@ -455,8 +457,15 @@ func cors(next http.Handler) http.Handler {
 func logRequest(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				log.Printf("%s %s panic after %s: %v", r.Method, r.URL.Path, time.Since(start).Round(time.Millisecond), recovered)
+				writeError(w, http.StatusInternalServerError, "internal server error")
+				return
+			}
+			log.Printf("%s %s %s", r.Method, r.URL.Path, time.Since(start).Round(time.Millisecond))
+		}()
 		next.ServeHTTP(w, r)
-		log.Printf("%s %s %s", r.Method, r.URL.Path, time.Since(start).Round(time.Millisecond))
 	})
 }
 
