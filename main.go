@@ -2423,7 +2423,7 @@ const indexHTML = `<!doctype html>
       box-shadow: 0 0 0 3px rgba(29, 102, 209, .12);
     }
     main {
-      width: min(1180px, calc(100% - 32px));
+      width: min(1440px, calc(100% - 24px));
       margin: 0 auto;
       padding: 26px 0 34px;
     }
@@ -2567,11 +2567,11 @@ const indexHTML = `<!doctype html>
       font-weight: 800;
       background: #fbfcfe;
     }
-    th.name-col { width: 34%; }
-    th.progress-col { width: 20%; }
-    th.small-col { width: 11%; }
-    th.action-col { width: 250px; }
-    .task-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+    th.name-col { width: 31%; }
+    th.progress-col { width: 18%; }
+    th.small-col { width: 10%; }
+    th.action-col { width: 210px; }
+    .task-actions { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
     tbody tr:hover { background: #fbfdff; }
     .task-name {
       display: block;
@@ -2603,6 +2603,32 @@ const indexHTML = `<!doctype html>
     .pill.completed { background: #eaf7ef; color: var(--green); }
     .pill.metadata, .pill.metadata_timeout { background: #fff4df; color: var(--amber); }
     .pill.paused, .pill.stopped { background: #f1f3f6; color: #596273; }
+    .status-stack { display: flex; align-items: center; gap: 7px; min-width: 0; }
+    .status-stack .pill { flex: 0 0 auto; }
+    .status-stack .muted { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .status-line {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      flex-wrap: wrap;
+    }
+    .diagnostic {
+      display: block;
+      max-width: 100%;
+      color: #31405a;
+      font-size: 12px;
+      line-height: 1.35;
+      white-space: normal;
+      overflow-wrap: anywhere;
+    }
+    .meta-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 5px 10px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.4;
+    }
     .bar {
       height: 9px;
       background: #e7ecf3;
@@ -2617,9 +2643,26 @@ const indexHTML = `<!doctype html>
       border-radius: inherit;
       transition: width .25s ease;
     }
-    .progress-text { margin-top: 6px; color: var(--muted); font-size: 12px; }
-    .metric { font-weight: 760; }
-    .muted { color: var(--muted); font-size: 12px; }
+    .progress-text { margin-top: 6px; color: var(--muted); font-size: 12px; line-height: 1.35; }
+    .metric { font-weight: 760; line-height: 1.35; overflow-wrap: anywhere; }
+    .metric-stack {
+      display: grid;
+      gap: 4px;
+      align-items: start;
+    }
+    .metric-stack strong {
+      font-size: 14px;
+      line-height: 1.2;
+    }
+    .short-code {
+      display: inline-block;
+      margin-top: 5px;
+      color: #6b7484;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+      line-height: 1.2;
+    }
+    .muted { color: var(--muted); font-size: 12px; line-height: 1.4; }
     .file-detail-cell { padding: 0 12px 14px; background: #fbfcfe; }
     .file-panel {
       border: 1px solid #e1e6ee;
@@ -2801,6 +2844,35 @@ const statusText = status => ({
   completed: "已完成",
   stopped: "已停止"
 }[status] || status || "未知");
+
+function shortHash(value) {
+  value = String(value || "");
+  return value.length > 12 ? value.slice(0, 12) : value;
+}
+
+function shortDiagnostic(task) {
+  const map = {
+    completed: "完成",
+    metadata_timeout: "元数据超时",
+    paused: "已暂停",
+    awaiting_selection: "待选文件",
+    metadata_no_sources: "无发现源",
+    metadata_no_peers: "暂无 Peer",
+    metadata_searching: "查找资源中",
+    queued: "排队中",
+    waiting: "等待调度",
+    no_sources: "无发现源",
+    no_peers: "暂无 Peer",
+    connecting: "连接 Peer",
+    pending_peers: "连接中",
+    no_seeders: "暂无做种",
+    stalled: "速度停滞",
+    warming_up: "等待数据",
+    listen_unavailable: "监听受限",
+    downloading: "下载正常"
+  };
+  return map[task.diagnosticCode] || statusText(task.status);
+}
 
 function setMessage(text, type) {
   const el = document.getElementById("message");
@@ -3141,39 +3213,22 @@ function renderTask(tbody, task) {
   const name = document.createElement("span");
   name.className = "task-name";
   name.textContent = task.name || "等待元数据";
-  const hash = document.createElement("code");
-  hash.textContent = task.infoHash || task.id || "";
+  const hash = document.createElement("span");
+  hash.className = "short-code";
+  hash.textContent = shortHash(task.infoHash || task.id || "");
   nameWrap.append(name, hash);
   tr.appendChild(cell("名称", nameWrap));
 
   const statusWrap = document.createElement("div");
+  statusWrap.className = "status-stack";
+  statusWrap.title = shortDiagnostic(task);
   const pill = document.createElement("span");
   pill.className = "pill " + (task.status || "");
   pill.textContent = statusText(task.status);
   const meta = document.createElement("div");
   meta.className = "muted";
-  if (task.paused) {
-    meta.textContent = task.metadataReady ? "已暂停文件下载" : "已暂停下载调度";
-  } else if (task.awaitingSelection) {
-    meta.textContent = "展开文件后保存选择";
-  } else if (!task.metadataReady) {
-    meta.textContent = "DHT/Tracker 查找中 " + fmtDuration(task.metadataAgeSeconds);
-  } else if (task.queued) {
-    meta.textContent = "排队位置 " + task.queuePosition;
-  } else {
-    meta.textContent = task.active ? "正在拉取数据" : "等待调度";
-  }
-  const tracker = document.createElement("div");
-  tracker.className = "muted";
-  if (task.stalled) {
-    tracker.textContent = task.diagnostic || ("可能卡住 " + fmtDuration(task.stalledSeconds));
-  } else {
-    tracker.textContent = task.diagnostic || ((task.source || "magnet") + " · trackers " + (task.trackerCount || 0));
-  }
-  const discovery = document.createElement("div");
-  discovery.className = "muted";
-  discovery.textContent = "源 " + (task.source || "magnet") + " · Tracker " + (task.trackerCount || 0) + " · DHT " + (task.dhtEnabled ? task.dhtServers : 0);
-  statusWrap.append(pill, meta, tracker, discovery);
+  meta.textContent = task.queued ? "队列 " + task.queuePosition : (task.active ? "运行" : "待命");
+  statusWrap.append(pill, meta);
   tr.appendChild(cell("状态", statusWrap));
 
   const progressWrap = document.createElement("div");
@@ -3194,9 +3249,10 @@ function renderTask(tbody, task) {
   tr.appendChild(cell("速度", speed));
 
   const peers = document.createElement("div");
-  peers.innerHTML = "<strong></strong><br><span class=\"muted\"></span>";
+  peers.className = "metric-stack";
+  peers.innerHTML = "<strong></strong><span class=\"muted\"></span>";
   peers.querySelector("strong").textContent = (task.activePeers || 0) + "/" + (task.peers || 0);
-  peers.querySelector("span").textContent = "known " + (task.knownPeers || 0) + " · seeders " + (task.seeders || 0) + " · pending " + (task.pendingPeers || 0) + " · half " + (task.halfOpenPeers || 0);
+  peers.querySelector("span").textContent = "做种 " + (task.seeders || 0);
   tr.appendChild(cell("Peer", peers));
 
   const size = document.createElement("div");
@@ -3228,26 +3284,11 @@ function renderTask(tbody, task) {
   remove.textContent = "移除";
   remove.onclick = () => deleteTask(task.id, false);
   actions.appendChild(remove);
-  const top = document.createElement("button");
-  top.className = "secondary compact";
-  top.textContent = "置顶";
-  top.onclick = () => moveTask(task.id, "top");
-  actions.appendChild(top);
   const up = document.createElement("button");
   up.className = "secondary compact";
   up.textContent = "上移";
   up.onclick = () => moveTask(task.id, "up");
   actions.appendChild(up);
-  const down = document.createElement("button");
-  down.className = "secondary compact";
-  down.textContent = "下移";
-  down.onclick = () => moveTask(task.id, "down");
-  actions.appendChild(down);
-  const bottom = document.createElement("button");
-  bottom.className = "secondary compact";
-  bottom.textContent = "底部";
-  bottom.onclick = () => moveTask(task.id, "bottom");
-  actions.appendChild(bottom);
   if (task.files && task.files.length) {
     const files = document.createElement("button");
     files.className = "secondary compact";
