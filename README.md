@@ -96,13 +96,24 @@ Windows output:
 
 ```text
 bin/bt-go-desktop-windows-amd64.exe
+dist/bt-go-desktop-windows-amd64.exe
 dist/bt-go-desktop-windows-amd64.zip
+dist/bt-go-desktop-windows-amd64.exe.sha256
 dist/bt-go-desktop-windows-amd64.zip.sha256
 ```
 
 The Windows desktop build starts the same local download service on a random `127.0.0.1` port and opens Microsoft Edge in app-window mode. If Edge app mode is unavailable, it falls back to opening the default browser. Windows 10 and Windows 11 should keep Microsoft Edge or Microsoft WebView2 Runtime installed.
 
 For better speed, allow inbound TCP and UDP on the BitTorrent listen port in your firewall/router.
+
+Release artifacts include raw desktop executables and zipped copies:
+
+```text
+bt-go-desktop-windows-amd64.exe
+bt-go-desktop-windows-amd64.zip
+bt-go-desktop-darwin-arm64
+bt-go-desktop-darwin-arm64.zip
+```
 
 GitHub Actions release packaging is available in `.github/workflows/release.yml`. Push a tag like
 `v0.1.0` or run the workflow manually to build zipped desktop artifacts and SHA256 files.
