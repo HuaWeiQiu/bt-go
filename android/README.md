@@ -13,13 +13,15 @@ There is no login, registration, remote account, or cloud user system. Tasks and
 Output:
 
 ```text
-android/app/build/outputs/apk/debug/app-debug.apk
+dist/bt-go-android-debug.apk
+dist/bt-go-android-debug.apk.sha256
 ```
 
 Required local tools:
 
 - JDK 17
 - Android SDK platform 36 and build-tools
+- Android NDK 28.2.13676358
 - `gomobile`
 - `gobind`
 

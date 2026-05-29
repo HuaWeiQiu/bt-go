@@ -358,7 +358,7 @@ public class MainActivity extends Activity {
         if ("high".equals(priority) || "normal".equals(priority) || "skip".equals(priority)) {
             return priority;
         }
-        return file.optBoolean("selected", true) ? "normal" : "skip";
+        return file.optBoolean("selected", true) ? "high" : "skip";
     }
 
     private void setDraftPriority(String id, String path, String priority) {

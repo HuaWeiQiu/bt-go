@@ -28,6 +28,7 @@ There are two ways to publish this project:
    - Users download the built file and run it directly.
    - Windows users download `bt-go-desktop-windows-amd64.exe`.
    - macOS users download `bt-go-desktop` or a packaged `.app` if you create one.
+   - Android users download `bt-go-android-debug.apk` and install it manually.
 
 Do not commit `bin/` or `downloads/` to the source repository. They are ignored by `.gitignore`. Put built binaries in GitHub Releases instead.
 
@@ -104,7 +105,7 @@ The Windows desktop build starts the same local download service on a random `12
 
 For better speed, allow inbound TCP and UDP on the BitTorrent listen port in your firewall/router.
 
-Release artifacts include raw desktop executables and zipped copies:
+Release artifacts include raw desktop executables, zipped desktop copies, and the Android debug APK:
 
 ```text
 bt-go-desktop-windows-amd64.exe
@@ -113,10 +114,12 @@ bt-go-desktop-darwin-arm64
 bt-go-desktop-darwin-arm64.zip
 bt-go-desktop-linux-amd64
 bt-go-desktop-linux-amd64.zip
+bt-go-android-debug.apk
 ```
 
 GitHub Actions release packaging is available in `.github/workflows/release.yml`. Push a tag like
-`v0.1.0` or run the workflow manually to build desktop artifacts, zipped copies, and SHA256 files.
+`v0.1.0` or run the workflow manually to build desktop artifacts, the Android debug APK, zipped
+copies, and SHA256 files.
 
 ## API
 

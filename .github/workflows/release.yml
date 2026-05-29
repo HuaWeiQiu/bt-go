@@ -91,9 +91,57 @@ jobs:
             dist/*.zip
             dist/*.sha256
 
+  build-android:
+    name: build android debug apk
+    needs: test
+    runs-on: ubuntu-latest
+    env:
+      BT_GO_VERSION_CODE: ${{ github.run_number }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.3"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "9.5.1"
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK pieces
+        run: |
+          sdkmanager "platforms;android-36" "build-tools;36.0.0" "ndk;28.2.13676358"
+
+      - name: Install gomobile tools
+        run: |
+          go install golang.org/x/mobile/cmd/gomobile@v0.0.0-20260520154334-0e4426e1883d
+          go install golang.org/x/mobile/cmd/gobind@v0.0.0-20260520154334-0e4426e1883d
+          gomobile init
+
+      - name: Build APK
+        run: |
+          export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/28.2.13676358"
+          ./build-android.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bt-go-android-debug
+          path: |
+            dist/bt-go-android-debug.apk
+            dist/bt-go-android-debug.apk.sha256
+
   publish:
     if: startsWith(github.ref, 'refs/tags/')
-    needs: build
+    needs:
+      - build
+      - build-android
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
