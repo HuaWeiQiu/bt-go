@@ -6,7 +6,7 @@ mkdir -p bin
 mkdir -p dist
 
 GOOS=windows GOARCH=amd64 CGO_ENABLED=0 \
-  go build -tags desktop -trimpath -ldflags "-s -w" -o bin/bt-go-desktop-windows-amd64.exe .
+  go build -tags desktop -trimpath -ldflags "-s -w" -o bin/bt-go-desktop-windows-amd64.exe ./cmd/bt-go
 
 rm -f dist/bt-go-desktop-windows-amd64.zip dist/bt-go-desktop-windows-amd64.zip.sha256
 (cd bin && zip -q ../dist/bt-go-desktop-windows-amd64.zip bt-go-desktop-windows-amd64.exe)

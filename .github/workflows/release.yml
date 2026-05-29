@@ -67,7 +67,7 @@ jobs:
           CGO_ENABLED: ${{ matrix.cgo }}
         run: |
           mkdir -p dist
-          go build -tags desktop -trimpath -ldflags "-s -w" -o "dist/bt-go-desktop-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}" .
+          go build -tags desktop -trimpath -ldflags "-s -w" -o "dist/bt-go-desktop-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}" ./cmd/bt-go
 
       - name: Package
         shell: bash

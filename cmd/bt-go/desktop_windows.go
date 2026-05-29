@@ -13,11 +13,13 @@ import (
 	"os/signal"
 	"syscall"
 	"time"
+
+	btgo "bt-go"
 )
 
 func main() {
-	dataDir := flag.String("dir", getenv("BT_GO_DIR", "./downloads"), "download directory")
-	listenPort := flag.Int("port", getenvInt("BT_GO_LISTEN_PORT", 42069), "BitTorrent listen port")
+	dataDir := flag.String("dir", btgo.Getenv("BT_GO_DIR", "./downloads"), "download directory")
+	listenPort := flag.Int("port", btgo.GetenvInt("BT_GO_LISTEN_PORT", 42069), "BitTorrent listen port")
 	flag.Parse()
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -25,7 +27,7 @@ func main() {
 		log.Fatalf("open local desktop service port: %v", err)
 	}
 
-	httpServer, addr, cleanup, err := runHTTPOnListener(ln, *dataDir, *listenPort)
+	httpServer, addr, cleanup, err := btgo.RunHTTPOnListener(ln, *dataDir, *listenPort)
 	if err != nil {
 		log.Fatal(err)
 	}

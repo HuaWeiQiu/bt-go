@@ -22,7 +22,7 @@ There are two ways to publish this project:
 
 1. Source code repository
    - Users need Go installed.
-   - They run `go run .` or build it locally.
+   - They run `go run ./cmd/bt-go` or build it locally.
 
 2. GitHub Release binaries
    - Users download the built file and run it directly.
@@ -38,7 +38,7 @@ HTTP version:
 ```bash
 cd /Users/tanye/test/bt-go
 go mod tidy
-go run .
+go run ./cmd/bt-go
 ```
 
 Open:
@@ -58,20 +58,20 @@ Default values:
 Equivalent flags:
 
 ```bash
-go run . -addr :8088 -dir ./downloads -port 42069
+go run ./cmd/bt-go -addr :8088 -dir ./downloads -port 42069
 ```
 
 Desktop version on macOS:
 
 ```bash
 cd /Users/tanye/test/bt-go
-go run -tags desktop .
+go run -tags desktop ./cmd/bt-go
 ```
 
 Build desktop binary:
 
 ```bash
-go build -tags desktop -o bin/bt-go-desktop .
+go build -tags desktop -o bin/bt-go-desktop ./cmd/bt-go
 ./bin/bt-go-desktop
 ```
 
@@ -96,9 +96,7 @@ Windows output:
 
 ```text
 bin/bt-go-desktop-windows-amd64.exe
-dist/bt-go-desktop-windows-amd64.exe
 dist/bt-go-desktop-windows-amd64.zip
-dist/bt-go-desktop-windows-amd64.exe.sha256
 dist/bt-go-desktop-windows-amd64.zip.sha256
 ```
 
@@ -113,6 +111,9 @@ bt-go-desktop-windows-amd64.exe
 bt-go-desktop-windows-amd64.zip
 bt-go-desktop-darwin-arm64
 bt-go-desktop-darwin-arm64.zip
+bt-go-desktop-linux-amd64
+bt-go-desktop-linux-amd64.zip
+app-debug.apk
 ```
 
 GitHub Actions release packaging is available in `.github/workflows/release.yml`. Push a tag like

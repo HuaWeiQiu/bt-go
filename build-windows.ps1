@@ -9,7 +9,7 @@ New-Item -ItemType Directory -Force -Path "dist" | Out-Null
 $env:GOOS = "windows"
 $env:GOARCH = "amd64"
 $env:CGO_ENABLED = "0"
-go build -tags desktop -trimpath -ldflags "-s -w" -o "bin\bt-go-desktop-windows-amd64.exe" .
+go build -tags desktop -trimpath -ldflags "-s -w" -o "bin\bt-go-desktop-windows-amd64.exe" ./cmd/bt-go
 
 $zipPath = "dist\bt-go-desktop-windows-amd64.zip"
 $shaPath = "$zipPath.sha256"

@@ -1,16 +1,19 @@
-package main
+package btgo
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/anacrolix/torrent/bencode"
 	"github.com/anacrolix/torrent/metainfo"
@@ -107,8 +110,12 @@ func TestAddMagnetBeforeMetadataReturnsTask(t *testing.T) {
 	if !strings.Contains(rec.Body.String(), `"status":"metadata"`) {
 		t.Fatalf("expected metadata status, got body=%s", rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), `"trackerCount":6`) {
-		t.Fatalf("expected default trackers to be attached, got body=%s", rec.Body.String())
+	var status taskStatus
+	if err := json.Unmarshal(rec.Body.Bytes(), &status); err != nil {
+		t.Fatal(err)
+	}
+	if status.TrackerCount < len(defaultPublicTrackers) {
+		t.Fatalf("expected at least %d default trackers, got %d", len(defaultPublicTrackers), status.TrackerCount)
 	}
 
 	del := httptest.NewRequest(http.MethodDelete, "/api/tasks/0000000000000000000000000000000000000001", nil)
@@ -132,6 +139,17 @@ func TestParseMagnetMergesDefaultTrackers(t *testing.T) {
 	}
 }
 
+func TestParseMagnetRemovesWhitespace(t *testing.T) {
+	magnet := "  magnet:?xt=urn:btih:0000000000000000000000000000000000000001\n\t&dn=bt-go test  "
+	mi, err := parseMagnet(magnet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mi.InfoHash.HexString() != "0000000000000000000000000000000000000001" {
+		t.Fatalf("expected info hash to parse after whitespace cleanup, got %s", mi.InfoHash.HexString())
+	}
+}
+
 func TestParseMagnetKeepsExistingTrackers(t *testing.T) {
 	magnet := "magnet:?xt=urn:btih:dafc8c076ca2f3ed376eeae7c76a0d6be2415c45&dn=ubuntu-26.04-desktop-amd64.iso&tr=https%3A%2F%2Ftorrent.ubuntu.com%2Fannounce&tr=https%3A%2F%2Fipv6.torrent.ubuntu.com%2Fannounce"
 	mi, err := parseMagnet(magnet)
@@ -144,6 +162,152 @@ func TestParseMagnetKeepsExistingTrackers(t *testing.T) {
 	}
 	if mi.Trackers[0] != "https://torrent.ubuntu.com/announce" {
 		t.Fatalf("expected original tracker first, got %#v", mi.Trackers[:2])
+	}
+}
+
+func TestParseMagnetWithDynamicDefaults(t *testing.T) {
+	defaults := []string{
+		"udp://tracker.example.com:6969/announce",
+		"udp://tracker.example.com:6969/announce",
+		"bad tracker",
+		"https://tracker.example.org:443/announce",
+	}
+	mi, err := parseMagnetWithDefaults("magnet:?xt=urn:btih:0000000000000000000000000000000000000001&dn=bt-go-test&tr=udp%3A%2F%2Ftracker.example.com%3A6969%2Fannounce", defaults)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(mi.Trackers) != 2 {
+		t.Fatalf("expected existing tracker plus one valid fallback, got %#v", mi.Trackers)
+	}
+	if mi.Trackers[0] != "udp://tracker.example.com:6969/announce" {
+		t.Fatalf("expected original tracker first, got %#v", mi.Trackers)
+	}
+	if mi.Trackers[1] != "https://tracker.example.org:443/announce" {
+		t.Fatalf("expected valid fallback tracker, got %#v", mi.Trackers)
+	}
+}
+
+func TestParseTrackerList(t *testing.T) {
+	raw := []byte(`
+# comment
+udp://tracker.example.com:6969/announce
+https://tracker.example.org:443/announce,udp://tracker.example.com:6969/announce
+not a tracker
+`)
+	trackers := parseTrackerList(raw)
+	if len(trackers) != 2 {
+		t.Fatalf("expected two valid unique trackers, got %#v", trackers)
+	}
+}
+
+func TestRankTrackersByHealthPrefersResponsiveTracker(t *testing.T) {
+	fast := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer fast.Close()
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(60 * time.Millisecond)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer slow.Close()
+
+	ranked := rankTrackersByHealth(context.Background(), []string{
+		"udp://127.0.0.1:1/announce",
+		slow.URL + "/announce",
+		fast.URL + "/announce",
+	})
+	if len(ranked) != 3 {
+		t.Fatalf("expected ranked trackers with fallback entries, got %#v", ranked)
+	}
+	if ranked[0] != fast.URL+"/announce" {
+		t.Fatalf("expected fast tracker first, got %#v", ranked)
+	}
+}
+
+func TestRankDhtNodesByHealthPrefersResponsiveNode(t *testing.T) {
+	addr, closeServer := startTestDhtPingServer(t)
+	defer closeServer()
+
+	ranked := rankDhtNodesByHealth(context.Background(), []string{
+		"127.0.0.1:1",
+		addr,
+	})
+	if len(ranked) != 2 {
+		t.Fatalf("expected ranked DHT nodes with fallback entries, got %#v", ranked)
+	}
+	if ranked[0] != addr {
+		t.Fatalf("expected responsive DHT node first, got %#v", ranked)
+	}
+}
+
+func startTestDhtPingServer(t *testing.T) (string, func()) {
+	t.Helper()
+	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		buf := make([]byte, 2048)
+		for {
+			n, peer, err := conn.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			raw := string(buf[:n])
+			idx := strings.Index(raw, "1:t2:")
+			if idx < 0 || len(raw) < idx+6 {
+				continue
+			}
+			transactionID := raw[idx+5 : idx+7]
+			resp := "d1:rd2:id20:01234567890123456789e1:t2:" + transactionID + "1:y1:re"
+			_, _ = conn.WriteTo([]byte(resp), peer)
+		}
+	}()
+	return conn.LocalAddr().String(), func() {
+		_ = conn.Close()
+		<-done
+	}
+}
+
+func TestPrivateTorrentDoesNotAddPublicTrackers(t *testing.T) {
+	private := true
+	info := metainfo.Info{
+		Name:        "private-fixture.txt",
+		PieceLength: 16 * 1024,
+		Length:      11,
+		Pieces:      bytes.Repeat([]byte{7}, 20),
+		Private:     &private,
+	}
+	infoBytes, err := bencode.Marshal(info)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mi := metainfo.MetaInfo{
+		InfoBytes: infoBytes,
+		Announce:  "https://private.example/announce",
+	}
+	var file bytes.Buffer
+	if err := mi.Write(&file); err != nil {
+		t.Fatal(err)
+	}
+
+	srv, cleanup, _, err := newServer(t.TempDir(), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+
+	rec := uploadFixtureTorrent(t, newMux(srv), "private.torrent", file.Bytes())
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected status 201, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"trackerCount":1`) {
+		t.Fatalf("expected only private tracker, got body=%s", rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "tracker.opentrackr.org") {
+		t.Fatalf("expected no public trackers for private torrent, got body=%s", rec.Body.String())
 	}
 }
 
@@ -205,9 +369,18 @@ func TestUploadTorrentFileCreatesTask(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer cleanup()
+	handler := newMux(srv)
+
+	req := httptest.NewRequest(http.MethodPut, "/api/settings", strings.NewReader(`{"maxActiveDownloads":3,"downloadRateLimitBytes":0,"waitForFileSelection":false}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected settings status 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
 
 	_, torrentBytes := buildFixtureTorrent(t, "bt-go-fixture.txt", 1)
-	rec := uploadFixtureTorrent(t, newMux(srv), "fixture.torrent", torrentBytes)
+	rec = uploadFixtureTorrent(t, handler, "fixture.torrent", torrentBytes)
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("expected status 201, got %d body=%s", rec.Code, rec.Body.String())
 	}
@@ -299,14 +472,22 @@ func TestPauseResumeTaskAndPersistPausedState(t *testing.T) {
 		t.Fatal(err)
 	}
 	handler := newMux(srv)
+	req := httptest.NewRequest(http.MethodPut, "/api/settings", strings.NewReader(`{"maxActiveDownloads":3,"downloadRateLimitBytes":0,"waitForFileSelection":false}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected settings status 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+
 	mi, torrentBytes := buildFixtureTorrent(t, "paused-fixture.txt", 3)
-	rec := uploadFixtureTorrent(t, handler, "paused.torrent", torrentBytes)
+	rec = uploadFixtureTorrent(t, handler, "paused.torrent", torrentBytes)
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("expected status 201, got %d body=%s", rec.Code, rec.Body.String())
 	}
 	id := mi.HashInfoBytes().HexString()
 
-	req := httptest.NewRequest(http.MethodPost, "/api/tasks/"+id+"/pause", nil)
+	req = httptest.NewRequest(http.MethodPost, "/api/tasks/"+id+"/pause", nil)
 	rec = httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
@@ -608,6 +789,13 @@ func TestPauseAllAndResumeAll(t *testing.T) {
 	}
 	defer cleanup()
 	handler := newMux(srv)
+	req := httptest.NewRequest(http.MethodPut, "/api/settings", strings.NewReader(`{"maxActiveDownloads":3,"downloadRateLimitBytes":0,"waitForFileSelection":false}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected settings status 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
 
 	firstMI, firstBytes := buildFixtureTorrent(t, "batch-one.txt", 6)
 	secondMI, secondBytes := buildFixtureTorrent(t, "batch-two.txt", 7)
@@ -618,8 +806,8 @@ func TestPauseAllAndResumeAll(t *testing.T) {
 		t.Fatalf("expected second upload 201, got %d body=%s", rec.Code, rec.Body.String())
 	}
 
-	req := httptest.NewRequest(http.MethodPost, "/api/tasks/pause-all", nil)
-	rec := httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/api/tasks/pause-all", nil)
+	rec = httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected pause-all 200, got %d body=%s", rec.Code, rec.Body.String())

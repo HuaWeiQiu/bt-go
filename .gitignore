@@ -7,3 +7,10 @@ downloads/
 *.log
 *.test
 coverage.out
+.gradle/
+build/
+android/app/build/
+android/app/libs/*.aar
+android/app/libs/*.jar
+third_party/anet/mobile/libs/*.aar
+third_party/anet/mobile/libs/*.jar
