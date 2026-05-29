@@ -22,6 +22,13 @@ func (e *Engine) Close() {
 	e.core = nil
 }
 
+func (e *Engine) FlushState() error {
+	if e == nil || e.core == nil {
+		return nil
+	}
+	return e.core.FlushState()
+}
+
 func (e *Engine) DataDir() string {
 	if e == nil || e.core == nil {
 		return ""

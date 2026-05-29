@@ -12,5 +12,6 @@ build/
 android/app/build/
 android/app/libs/*.aar
 android/app/libs/*.jar
+android/app/src/main/jniLibs/
 third_party/anet/mobile/libs/*.aar
 third_party/anet/mobile/libs/*.jar

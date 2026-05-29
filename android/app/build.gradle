@@ -10,8 +10,8 @@ android {
         applicationId "com.btgo.mobile"
         minSdk 26
         targetSdk 36
-        versionCode Integer.parseInt(System.getenv("BT_GO_VERSION_CODE") ?: "8")
-        versionName System.getenv("BT_GO_VERSION_NAME") ?: "0.1.8"
+        versionCode Integer.parseInt(System.getenv("BT_GO_VERSION_CODE") ?: "9")
+        versionName System.getenv("BT_GO_VERSION_NAME") ?: "0.1.9"
     }
 }
 

@@ -30,6 +30,13 @@ func (e *Engine) Close() {
 	e.cleanup = nil
 }
 
+func (e *Engine) FlushState() error {
+	if e == nil || e.srv == nil || e.srv.downloads == nil {
+		return errors.New("engine is closed")
+	}
+	return e.srv.downloads.saveState()
+}
+
 func (e *Engine) DataDir() string {
 	if e == nil {
 		return ""

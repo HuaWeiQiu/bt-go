@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/anacrolix/torrent"
 	"github.com/anacrolix/torrent/bencode"
 	"github.com/anacrolix/torrent/metainfo"
 	"golang.org/x/time/rate"
@@ -197,6 +198,53 @@ not a tracker
 	trackers := parseTrackerList(raw)
 	if len(trackers) != 2 {
 		t.Fatalf("expected two valid unique trackers, got %#v", trackers)
+	}
+}
+
+func TestFetchPublicTrackersMergesSourcesConcurrently(t *testing.T) {
+	fast := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("udp://fast.example.com:6969/announce\n"))
+	}))
+	defer fast.Close()
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(80 * time.Millisecond)
+		_, _ = w.Write([]byte("udp://slow.example.com:6969/announce\n"))
+	}))
+	defer slow.Close()
+
+	start := time.Now()
+	trackers, err := fetchPublicTrackers(context.Background(), []string{
+		slow.URL,
+		fast.URL,
+	}, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if time.Since(start) > 150*time.Millisecond {
+		t.Fatalf("expected tracker sources to fetch concurrently, took %s", time.Since(start))
+	}
+	if len(trackers) != 2 {
+		t.Fatalf("expected both trackers, got %#v", trackers)
+	}
+}
+
+func TestRefreshWithProgressSmoothsDownloadSpeed(t *testing.T) {
+	now := time.Now()
+	last := progressSample{
+		At:            now.Add(-time.Second),
+		ProgressAt:    now.Add(-time.Second),
+		Completed:     1024 * 1024,
+		BytesReadData: 1024 * 1024,
+		Speed:         1024 * 1024,
+	}
+
+	updated, delta := updateProgressSample(last, now, 6*1024*1024, 6*1024*1024)
+	if delta != 5*1024*1024 {
+		t.Fatalf("expected bytes-read delta, got %d", delta)
+	}
+	speed := updated.Speed
+	if speed <= 1024*1024 || speed >= 5*1024*1024 {
+		t.Fatalf("expected smoothed speed between previous and instant rate, got %.2f", speed)
 	}
 }
 
@@ -410,6 +458,78 @@ func TestUpdateSettingsRejectsInvalidConcurrency(t *testing.T) {
 	}
 }
 
+func TestDefaultSettingsFavorSingleActiveDownload(t *testing.T) {
+	settings := defaultAppSettings()
+	if settings.MaxActiveDownloads != 1 {
+		t.Fatalf("expected one active download by default, got %d", settings.MaxActiveDownloads)
+	}
+	if settings.DownloadRateLimitBytes != 0 {
+		t.Fatalf("expected unlimited download rate by default, got %d", settings.DownloadRateLimitBytes)
+	}
+}
+
+func TestTorrentClientUsesHighThroughputDiscoverySettings(t *testing.T) {
+	cfg := newTorrentClientConfig(t.TempDir(), 42069, newDiscoveryManager(defaultPublicTrackers), rate.NewLimiter(rate.Inf, 1<<20))
+	if cfg.NoDefaultPortForwarding {
+		t.Fatalf("expected default port forwarding to be enabled")
+	}
+	if cfg.EstablishedConnsPerTorrent < 350 {
+		t.Fatalf("expected high per-torrent connection limit, got %d", cfg.EstablishedConnsPerTorrent)
+	}
+	if cfg.TorrentPeersLowWater < 500 {
+		t.Fatalf("expected aggressive peer refill threshold, got %d", cfg.TorrentPeersLowWater)
+	}
+	if cfg.DialRateLimiter == nil || cfg.DialRateLimiter.Limit() < 150 {
+		t.Fatalf("expected aggressive dial rate limiter, got %#v", cfg.DialRateLimiter)
+	}
+	if cfg.MaxUnverifiedBytes < 1024<<20 {
+		t.Fatalf("expected large unverified byte window, got %d", cfg.MaxUnverifiedBytes)
+	}
+	if cfg.PieceHashersPerTorrent < 6 {
+		t.Fatalf("expected parallel piece hashing, got %d", cfg.PieceHashersPerTorrent)
+	}
+}
+
+func TestSyncTrackersToTorrentReordersAnnounceList(t *testing.T) {
+	srv, cleanup, _, err := newServer(t.TempDir(), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	handler := newMux(srv)
+
+	mi, torrentBytes := buildFixtureTorrent(t, "ranked-trackers.txt", 9)
+	rec := uploadFixtureTorrent(t, handler, "ranked-trackers.torrent", torrentBytes)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected status 201, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	task, ok := srv.downloads.get(mi.HashInfoBytes().HexString())
+	if !ok {
+		t.Fatalf("expected uploaded torrent task")
+	}
+
+	fastTracker := "https://tracker.example.org:443/announce"
+	if !task.prioritizeTrackers([]string{fastTracker}) {
+		t.Fatalf("expected tracker ranking to update task tracker order")
+	}
+	syncTrackersToTorrent(task.torrent, task.trackersSnapshot())
+
+	got := task.torrent.Metainfo().AnnounceList.DistinctValues()
+	if len(got) == 0 || got[0] != fastTracker {
+		t.Fatalf("expected prioritized tracker first, got %#v", got)
+	}
+	foundOriginal := false
+	for _, tracker := range got {
+		if tracker == mi.Announce {
+			foundOriginal = true
+			break
+		}
+	}
+	if !foundOriginal {
+		t.Fatalf("expected original tracker %q to remain in announce list: %#v", mi.Announce, got)
+	}
+}
+
 func TestUploadTorrentFileCreatesTask(t *testing.T) {
 	srv, cleanup, _, err := newServer(t.TempDir(), 0)
 	if err != nil {
@@ -509,6 +629,52 @@ func TestStatePersistsTorrentMetadata(t *testing.T) {
 	status := restored.downloads.status(task)
 	if !status.MetadataReady {
 		t.Fatalf("expected persisted torrent metadata to be restored, got %#v", status)
+	}
+}
+
+func TestSaveStateCapturesMagnetMetainfoForResume(t *testing.T) {
+	dir := t.TempDir()
+	srv, cleanup, _, err := newServer(dir, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	handler := newMux(srv)
+
+	mi, torrentBytes := buildFixtureTorrent(t, "magnet-resume-fixture.txt", 6)
+	magnet := mi.Magnet(nil, nil)
+	req := httptest.NewRequest(http.MethodPost, "/api/tasks", strings.NewReader(`{"magnet":"`+magnet.String()+`"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected task status 201, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	task, ok := srv.downloads.get(mi.HashInfoBytes().HexString())
+	if !ok {
+		t.Fatalf("expected magnet task")
+	}
+	meta, err := metainfo.Load(bytes.NewReader(torrentBytes))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := task.torrent.MergeSpec(torrent.TorrentSpecFromMetaInfo(meta)); err != nil {
+		t.Fatal(err)
+	}
+	<-task.torrent.GotInfo()
+
+	if err := srv.downloads.saveState(); err != nil {
+		t.Fatal(err)
+	}
+	saved, err := srv.downloads.state.load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(saved.Tasks) != 1 {
+		t.Fatalf("expected one saved task, got %#v", saved.Tasks)
+	}
+	if len(saved.Tasks[0].MetaInfo) == 0 {
+		t.Fatalf("expected magnet metainfo to be captured for resume")
 	}
 }
 

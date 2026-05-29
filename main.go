@@ -89,10 +89,11 @@ type downloadTask struct {
 }
 
 type progressSample struct {
-	At         time.Time
-	ProgressAt time.Time
-	Completed  int64
-	Speed      float64
+	At            time.Time
+	ProgressAt    time.Time
+	Completed     int64
+	BytesReadData int64
+	Speed         float64
 }
 
 type addRequest struct {
@@ -199,6 +200,8 @@ type taskStatus struct {
 	PendingPeers      int              `json:"pendingPeers"`
 	HalfOpenPeers     int              `json:"halfOpenPeers"`
 	ActivePeers       int              `json:"activePeers"`
+	ClientHalfOpen    int              `json:"clientHalfOpen"`
+	UndialablePeers   int              `json:"undialablePeers"`
 	Seeders           int              `json:"seeders"`
 	MetadataReady     bool             `json:"metadataReady"`
 	Files             []taskFileStatus `json:"files,omitempty"`
@@ -213,25 +216,9 @@ func newServer(dataDir string, listenPort int) (*server, func(), string, error) 
 		return nil, nil, "", fmt.Errorf("create download dir: %w", err)
 	}
 
-	cfg := torrent.NewDefaultClientConfig()
-	cfg.DataDir = absDir
-	cfg.Seed = true
-	cfg.NoUpload = false
-	cfg.NoDefaultPortForwarding = false
-	cfg.DisablePEX = false
-	cfg.DisableTCP = false
-	cfg.DisableUTP = false
-	cfg.ListenPort = listenPort
 	discovery := newDiscoveryManager(defaultPublicTrackers)
-	cfg.DhtStartingNodes = discovery.dhtStartingNodes
-	cfg.PeriodicallyAnnounceTorrentsToDht = false
 	downloadRateLimiter := rate.NewLimiter(rate.Inf, 1<<20)
-	cfg.DownloadRateLimiter = downloadRateLimiter
-	cfg.TorrentPeersLowWater = 50
-	cfg.TorrentPeersHighWater = 500
-	cfg.EstablishedConnsPerTorrent = 80
-	cfg.HalfOpenConnsPerTorrent = 30
-	cfg.TotalHalfOpenConns = 100
+	cfg := newTorrentClientConfig(absDir, listenPort, discovery, downloadRateLimiter)
 
 	client, err := torrent.NewClient(cfg)
 	if err != nil {
@@ -272,17 +259,60 @@ func newServer(dataDir string, listenPort int) (*server, func(), string, error) 
 	}
 	discoveryCtx, stopDiscoveryRefresh := context.WithCancel(context.Background())
 	var discoveryRefreshDone sync.WaitGroup
-	discoveryRefreshDone.Add(1)
+	discoveryRefreshDone.Add(2)
 	go func() {
 		defer discoveryRefreshDone.Done()
-		srv.downloads.refreshDiscoverySources(discoveryCtx)
+		srv.downloads.maintainDiscoverySources(discoveryCtx)
+	}()
+	go func() {
+		defer discoveryRefreshDone.Done()
+		srv.downloads.maintainActivePeerDiscovery(discoveryCtx)
 	}()
 	return srv, func() {
+		if err := srv.downloads.saveState(); err != nil {
+			log.Printf("save state during shutdown failed: %v", err)
+		}
 		stopDiscoveryRefresh()
 		discoveryRefreshDone.Wait()
 		_ = client.Close()
 		_ = state.Close()
 	}, absDir, nil
+}
+
+func newTorrentClientConfig(dataDir string, listenPort int, discovery *discoveryManager, downloadRateLimiter *rate.Limiter) *torrent.ClientConfig {
+	cfg := torrent.NewDefaultClientConfig()
+	cfg.DataDir = dataDir
+	cfg.Seed = true
+	cfg.NoUpload = false
+	cfg.NoDefaultPortForwarding = false
+	cfg.DisablePEX = false
+	cfg.DisableTCP = false
+	cfg.DisableUTP = false
+	cfg.ListenPort = listenPort
+	if discovery != nil {
+		cfg.DhtStartingNodes = discovery.dhtStartingNodes
+	}
+	cfg.PeriodicallyAnnounceTorrentsToDht = true
+	cfg.DownloadRateLimiter = downloadRateLimiter
+	cfg.TorrentPeersLowWater = 512
+	cfg.TorrentPeersHighWater = 5000
+	cfg.EstablishedConnsPerTorrent = 384
+	cfg.HalfOpenConnsPerTorrent = 256
+	cfg.TotalHalfOpenConns = 768
+	cfg.NominalDialTimeout = 6 * time.Second
+	cfg.MinDialTimeout = 800 * time.Millisecond
+	cfg.HandshakesTimeout = 4 * time.Second
+	cfg.DialRateLimiter = rate.NewLimiter(160, 320)
+	cfg.MaxUnverifiedBytes = 1024 << 20
+	hashers := runtime.NumCPU()
+	if hashers < 6 {
+		hashers = 6
+	}
+	if hashers > 12 {
+		hashers = 12
+	}
+	cfg.PieceHashersPerTorrent = hashers
+	return cfg
 }
 
 func newMux(srv *server) http.Handler {
@@ -611,7 +641,7 @@ func (m *downloadManager) add(magnet string) (*downloadTask, error) {
 	if err != nil {
 		return nil, fmt.Errorf("add magnet: %w", err)
 	}
-	t.AddTrackers(trackerTiers(trackerList))
+	syncTrackersToTorrent(t, trackerList)
 	t.DisallowDataDownload()
 	m.announceToDht(t, false)
 
@@ -693,7 +723,7 @@ func (m *downloadManager) addTorrent(r io.Reader) (*downloadTask, error) {
 	if err != nil {
 		return nil, fmt.Errorf("add torrent file: %w", err)
 	}
-	t.AddTrackers(trackerTiers(magnet.Trackers))
+	syncTrackersToTorrent(t, magnet.Trackers)
 	t.DisallowDataDownload()
 	m.announceToDht(t, private)
 
@@ -786,7 +816,7 @@ func (m *downloadManager) restoreTasks(saved []persistedTask) error {
 				continue
 			}
 		}
-		t.AddTrackers(trackerTiers(trackerList))
+		syncTrackersToTorrent(t, trackerList)
 		t.DisallowDataDownload()
 		m.announceToDht(t, private)
 		createdAt := savedTask.CreatedAt
@@ -1118,7 +1148,7 @@ func (m *downloadManager) refreshDiscovery(id string) (*downloadTask, error) {
 		return nil, errors.New("torrent is not ready")
 	}
 	if len(trackers) > 0 {
-		tor.AddTrackers(trackerTiers(trackers))
+		syncTrackersToTorrent(tor, trackers)
 	}
 	m.announceToDht(tor, task.Private)
 	go m.preflightDiscovery(task)
@@ -1149,6 +1179,13 @@ func (m *downloadManager) preflightDiscovery(task *downloadTask) {
 	if m == nil || task == nil {
 		return
 	}
+	m.discoverPeersForTask(context.Background(), task, true)
+}
+
+func (m *downloadManager) discoverPeersForTask(ctx context.Context, task *downloadTask, updateDiscoveryStatus bool) {
+	if m == nil || task == nil {
+		return
+	}
 	task.mu.Lock()
 	tor := task.torrent
 	private := task.Private
@@ -1158,8 +1195,10 @@ func (m *downloadManager) preflightDiscovery(task *downloadTask) {
 		return
 	}
 
-	task.setDiscovery("checking", 0, 0, nil)
-	ctx, cancel := context.WithTimeout(context.Background(), resourceDiscoveryTimeout)
+	if updateDiscoveryStatus {
+		task.setDiscovery("checking", 0, 0, nil)
+	}
+	ctx, cancel := context.WithTimeout(ctx, resourceDiscoveryTimeout)
 	defer cancel()
 	stopOnTaskDone := make(chan struct{})
 	go func() {
@@ -1173,36 +1212,122 @@ func (m *downloadManager) preflightDiscovery(task *downloadTask) {
 
 	results := probeResourceTrackers(ctx, trackers, tor.InfoHash(), m.client.PeerID(), localPeerPort(m.client.LocalPort()))
 	bestTrackers, trackerPeers, trackerSeeders, trackerPeerInfos := summarizeResourceTrackerProbes(results)
+	uniqueTrackerPeers := len(trackerPeerInfos)
+	addedPeers := 0
 	if len(trackerPeerInfos) > 0 {
-		tor.AddPeers(trackerPeerInfos)
+		addedPeers = tor.AddPeers(trackerPeerInfos)
 	}
 	if len(bestTrackers) > 0 && task.prioritizeTrackers(bestTrackers) {
-		tor.AddTrackers(trackerTiers(task.trackersSnapshot()))
+		syncTrackersToTorrent(tor, task.trackersSnapshot())
 		if err := m.saveState(); err != nil {
 			log.Printf("save ranked tracker state failed: %v", err)
 		}
 	}
 
+	m.refreshDhtNodes()
 	m.announceToDht(tor, private)
 	dhtPeers := 0
 	if trackerPeers == 0 && trackerSeeders == 0 {
 		dhtPeers = waitForDhtPeers(ctx, task, tor, resourceDhtPeerWait)
 	}
 	totalPeers := trackerPeers + dhtPeers
-	status := "unknown"
-	if totalPeers > 0 || trackerSeeders > 0 {
-		status = "available"
+	if updateDiscoveryStatus {
+		status := "unknown"
+		if totalPeers > 0 || trackerSeeders > 0 {
+			status = "available"
+		}
+		if errors.Is(ctx.Err(), context.Canceled) {
+			status = "unknown"
+		}
+		task.setDiscovery(status, totalPeers, trackerSeeders, bestTrackers)
+		if status == "available" {
+			log.Printf("resource preflight %s: raw_peers=%d unique_peers=%d added_peers=%d seeders=%d preferred_trackers=%d", task.ID, totalPeers, uniqueTrackerPeers, addedPeers, trackerSeeders, len(bestTrackers))
+		} else {
+			log.Printf("resource preflight %s: no confirmed peers yet", task.ID)
+		}
 	}
-	if errors.Is(ctx.Err(), context.Canceled) {
-		status = "unknown"
-	}
-	task.setDiscovery(status, totalPeers, trackerSeeders, bestTrackers)
-	if status == "available" {
-		log.Printf("resource preflight %s: peers=%d seeders=%d preferred_trackers=%d", task.ID, totalPeers, trackerSeeders, len(bestTrackers))
-	} else {
-		log.Printf("resource preflight %s: no confirmed peers yet", task.ID)
+	if totalPeers > 0 {
+		log.Printf("peer discovery %s: raw_peers=%d unique_peers=%d added_peers=%d tracker_seeders=%d", task.ID, totalPeers, uniqueTrackerPeers, addedPeers, trackerSeeders)
 	}
 	m.schedule()
+}
+
+func (m *downloadManager) maintainActivePeerDiscovery(ctx context.Context) {
+	m.discoverPeersForActiveTasks(ctx)
+	ticker := time.NewTicker(activePeerDiscoveryInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			m.discoverPeersForActiveTasks(ctx)
+		}
+	}
+}
+
+func (m *downloadManager) discoverPeersForActiveTasks(ctx context.Context) {
+	if m == nil {
+		return
+	}
+	m.mu.RLock()
+	tasks := make([]*downloadTask, 0, len(m.tasks))
+	for _, task := range m.tasks {
+		tasks = append(tasks, task)
+	}
+	m.mu.RUnlock()
+	sortTasks(tasks)
+
+	count := 0
+	for _, task := range tasks {
+		if ctx.Err() != nil || count >= activePeerDiscoveryMaxTasks {
+			return
+		}
+		if !task.needsPeerDiscovery(activePeerDiscoveryPeerTarget) {
+			continue
+		}
+		count++
+		go m.discoverPeersForTask(ctx, task, false)
+	}
+}
+
+func (t *downloadTask) needsPeerDiscovery(targetPeers int) bool {
+	if t == nil {
+		return false
+	}
+	t.mu.Lock()
+	tor := t.torrent
+	active := t.Active
+	paused := t.Paused
+	awaiting := t.AwaitingSelection
+	status := t.Status
+	private := t.Private
+	last := t.last
+	t.mu.Unlock()
+	if tor == nil || private || !active || paused || awaiting || status == "completed" || status == "stopped" || status == "metadata_timeout" {
+		return false
+	}
+	if tor.Info() == nil {
+		return true
+	}
+	stats := tor.Stats()
+	if stats.TotalPeers < targetPeers || len(tor.KnownSwarm()) < targetPeers {
+		return true
+	}
+	if stats.ActivePeers == 0 || stats.ConnectedSeeders == 0 {
+		return true
+	}
+	if last.Speed < 1 && !last.ProgressAt.IsZero() && time.Since(last.ProgressAt) >= activePeerDiscoveryStallThreshold {
+		return true
+	}
+	return false
+}
+
+func (m *downloadManager) refreshDhtNodes() {
+	if m == nil || m.client == nil || m.discovery == nil {
+		return
+	}
+	m.client.AddDhtNodes(m.discovery.DhtNodes())
 }
 
 type resourceTrackerProbe struct {
@@ -1274,10 +1399,10 @@ func announceResourceTracker(ctx context.Context, trackerURL string, infoHash me
 	resp, err := client.Announce(ctx, tracker.AnnounceRequest{
 		InfoHash: infoHash,
 		PeerId:   peerID,
-		Left:     -1,
+		Left:     1,
 		Uploaded: 0,
-		Event:    tracker.Started,
-		NumWant:  50,
+		Event:    tracker.None,
+		NumWant:  500,
 		Port:     port,
 	}, tracker.AnnounceOpt{UserAgent: "bt-go/1.0"})
 	result.RTT = time.Since(start)
@@ -1441,6 +1566,22 @@ func (m *downloadManager) refreshDiscoverySources(ctx context.Context) {
 	rankedDhtNodes := rankDhtNodesByHealth(ctx, m.discovery.DhtNodes())
 	if changed := m.discovery.UpdateDhtNodes(rankedDhtNodes); changed {
 		log.Printf("ranked DHT bootstrap nodes after health checks: %d nodes", len(m.discovery.DhtNodes()))
+		m.refreshDhtNodes()
+	}
+	m.discoverPeersForActiveTasks(ctx)
+}
+
+func (m *downloadManager) maintainDiscoverySources(ctx context.Context) {
+	m.refreshDiscoverySources(ctx)
+	ticker := time.NewTicker(discoverySourceRefreshInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			m.refreshDiscoverySources(ctx)
+		}
 	}
 }
 
@@ -1478,7 +1619,7 @@ func (m *downloadManager) applyDiscoveryTrackersToTasks() {
 		task.mu.Unlock()
 
 		if tor != nil {
-			tor.AddTrackers(trackerTiers(merged))
+			syncTrackersToTorrent(tor, merged)
 		}
 		changed = true
 	}
@@ -1523,7 +1664,7 @@ func (m *downloadManager) getSettings() appSettings {
 
 func defaultAppSettings() appSettings {
 	return appSettings{
-		MaxActiveDownloads:     3,
+		MaxActiveDownloads:     1,
 		DownloadRateLimitBytes: 0,
 		WaitForFileSelection:   false,
 	}
@@ -1568,6 +1709,7 @@ func (m *downloadManager) updateSettings(settings appSettings) (appSettings, err
 func (m *downloadManager) status(task *downloadTask) taskStatus {
 	var total, completed, missing int64
 	var peers, pendingPeers, halfOpenPeers, activePeers, seeders int
+	var clientHalfOpen, undialablePeers int
 	var knownPeers int
 	var bytesReadData, bytesWasted int64
 	metadataReady := false
@@ -1583,9 +1725,12 @@ func (m *downloadManager) status(task *downloadTask) taskStatus {
 		bytesReadData = stats.BytesReadData.Int64()
 		bytesWasted = stats.ChunksReadWasted.Int64()
 	}
+	clientStats := m.client.Stats()
+	clientHalfOpen = clientStats.ActiveHalfOpenAttempts
+	undialablePeers = clientStats.NumPeersUndialableWithoutHolepunch
 	total, completed, missing, files, metadataReady = task.progressSnapshot()
 
-	status, name, infoHash, savePath, createdAt, updatedAt, errText, speed, progressAt := task.refreshWithProgress(completed, total, missing)
+	status, name, infoHash, savePath, createdAt, updatedAt, errText, speed, progressAt := task.refreshWithProgress(completed, total, missing, bytesReadData)
 	metadataAge := int64(0)
 	if !metadataReady && status == "metadata" && !createdAt.IsZero() {
 		metadataAge = int64(time.Since(createdAt).Seconds())
@@ -1664,6 +1809,8 @@ func (m *downloadManager) status(task *downloadTask) taskStatus {
 		PendingPeers:      pendingPeers,
 		HalfOpenPeers:     halfOpenPeers,
 		ActivePeers:       activePeers,
+		ClientHalfOpen:    clientHalfOpen,
+		UndialablePeers:   undialablePeers,
 		Seeders:           seeders,
 		MetadataReady:     metadataReady,
 		Files:             files,
@@ -1674,6 +1821,7 @@ func (m *downloadManager) watch(task *downloadTask) {
 	select {
 	case <-task.torrent.GotInfo():
 		task.setName(task.torrent.Name())
+		task.rememberMetainfoFromTorrent()
 		if !task.isActive() && !task.isPaused() {
 			if m.getSettings().WaitForFileSelection && !task.hasFileSelectionSet() {
 				task.markAwaitingSelection()
@@ -1700,7 +1848,7 @@ func (m *downloadManager) watch(task *downloadTask) {
 		}
 		wasActive := task.isActive()
 		total, completed, missing, _, _ := task.progressSnapshot()
-		status, _, _, _, _, _, _, _, _ := task.refreshWithProgress(completed, total, missing)
+		status, _, _, _, _, _, _, _, _ := task.refreshWithProgress(completed, total, missing, task.bytesReadData())
 		if status == "awaiting_selection" {
 			if wasActive {
 				task.setActive(false)
@@ -1860,7 +2008,20 @@ func (m *downloadManager) saveState() error {
 	}
 	m.saveMu.Lock()
 	defer m.saveMu.Unlock()
+	m.captureReadyMetainfo()
 	return m.state.save(m.snapshotState())
+}
+
+func (m *downloadManager) captureReadyMetainfo() {
+	m.mu.RLock()
+	tasks := make([]*downloadTask, 0, len(m.tasks))
+	for _, task := range m.tasks {
+		tasks = append(tasks, task)
+	}
+	m.mu.RUnlock()
+	for _, task := range tasks {
+		task.rememberMetainfoFromTorrent()
+	}
 }
 
 func (t *downloadTask) setName(name string) {
@@ -1871,6 +2032,45 @@ func (t *downloadTask) setName(name string) {
 	t.Name = name
 	t.UpdatedAt = time.Now()
 	t.mu.Unlock()
+}
+
+func (t *downloadTask) rememberMetainfoFromTorrent() bool {
+	if t == nil {
+		return false
+	}
+	t.mu.Lock()
+	if len(t.metaInfo) > 0 {
+		t.mu.Unlock()
+		return false
+	}
+	tor := t.torrent
+	t.mu.Unlock()
+	if tor == nil || tor.Info() == nil {
+		return false
+	}
+
+	mi := tor.Metainfo()
+	if len(mi.InfoBytes) == 0 {
+		return false
+	}
+	var buf bytes.Buffer
+	if err := mi.Write(&buf); err != nil {
+		log.Printf("serialize torrent metainfo for resume failed: %v", err)
+		return false
+	}
+	raw := buf.Bytes()
+	if len(raw) == 0 {
+		return false
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if len(t.metaInfo) > 0 {
+		return false
+	}
+	t.metaInfo = append([]byte(nil), raw...)
+	t.UpdatedAt = time.Now()
+	return true
 }
 
 func (t *downloadTask) setState(status, errText string) {
@@ -2365,29 +2565,26 @@ func (t *downloadTask) progressSnapshot() (total, completed, missing int64, file
 	return total, completed, missing, result, metadataReady
 }
 
-func (t *downloadTask) refreshWithProgress(completed, total, missing int64) (status, name, infoHash, savePath string, createdAt, updatedAt time.Time, errText string, speed float64, progressAt time.Time) {
+func (t *downloadTask) bytesReadData() int64 {
+	t.mu.Lock()
+	tor := t.torrent
+	t.mu.Unlock()
+	if tor == nil {
+		return 0
+	}
+	stats := tor.Stats()
+	return stats.BytesReadData.Int64()
+}
+
+func (t *downloadTask) refreshWithProgress(completed, total, missing, bytesReadData int64) (status, name, infoHash, savePath string, createdAt, updatedAt time.Time, errText string, speed float64, progressAt time.Time) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
 	now := time.Now()
-	delta := int64(0)
-	if !t.last.At.IsZero() {
-		elapsed := now.Sub(t.last.At).Seconds()
-		if elapsed > 0 {
-			delta = completed - t.last.Completed
-			if delta < 0 {
-				delta = 0
-			}
-			t.last.Speed = float64(delta) / elapsed
-		}
-	}
-	t.last.At = now
-	if delta > 0 || t.last.ProgressAt.IsZero() {
-		t.last.ProgressAt = now
-	}
-	t.last.Completed = completed
+	t.last, _ = updateProgressSample(t.last, now, completed, bytesReadData)
 
 	if t.torrent == nil || t.Status == "stopped" {
+		t.last.Speed = 0
 		return t.Status, t.Name, t.InfoHash, t.SavePath, t.CreatedAt, t.UpdatedAt, t.Error, t.last.Speed, t.last.ProgressAt
 	}
 	if t.Paused {
@@ -2408,8 +2605,43 @@ func (t *downloadTask) refreshWithProgress(completed, total, missing int64) (sta
 	} else if t.Status != "metadata_timeout" {
 		t.Status = "queued"
 	}
+	if t.Status != "downloading" {
+		t.last.Speed = 0
+	}
 	t.UpdatedAt = time.Now()
 	return t.Status, t.Name, t.InfoHash, t.SavePath, t.CreatedAt, t.UpdatedAt, t.Error, t.last.Speed, t.last.ProgressAt
+}
+
+func updateProgressSample(last progressSample, now time.Time, completed, bytesReadData int64) (progressSample, int64) {
+	delta := int64(0)
+	if !last.At.IsZero() {
+		elapsed := now.Sub(last.At).Seconds()
+		if elapsed > 0 {
+			delta = bytesReadData - last.BytesReadData
+			if delta < 0 {
+				delta = completed - last.Completed
+			}
+			if delta < 0 {
+				delta = 0
+			}
+			sampleSpeed := float64(delta) / elapsed
+			weight := elapsed / (speedSmoothingWindow.Seconds() + elapsed)
+			if sampleSpeed <= 0 && !last.ProgressAt.IsZero() && now.Sub(last.ProgressAt) >= speedIdleResetWindow {
+				last.Speed = 0
+			} else if last.Speed <= 0 {
+				last.Speed = sampleSpeed
+			} else {
+				last.Speed = last.Speed + (sampleSpeed-last.Speed)*weight
+			}
+		}
+	}
+	last.At = now
+	last.Completed = completed
+	last.BytesReadData = bytesReadData
+	if delta > 0 || last.ProgressAt.IsZero() {
+		last.ProgressAt = now
+	}
+	return last, delta
 }
 
 func parseMagnet(raw string) (*metainfo.Magnet, error) {
@@ -2474,6 +2706,17 @@ func trackerTiers(trackers []string) [][]string {
 		tiers = append(tiers, []string{tracker})
 	}
 	return tiers
+}
+
+func syncTrackersToTorrent(tor *torrent.Torrent, trackers []string) {
+	if tor == nil {
+		return
+	}
+	tiers := trackerTiers(trackers)
+	if len(tiers) == 0 {
+		return
+	}
+	tor.ModifyTrackers(tiers)
 }
 
 func mergeTrackers(primary, fallback []string) []string {
@@ -2569,8 +2812,12 @@ func (m *discoveryManager) UpdateDhtNodes(nodes []string) bool {
 
 func fetchPublicTrackers(ctx context.Context, sources []string, timeout time.Duration) ([]string, error) {
 	client := &http.Client{Timeout: timeout}
-	var errs []error
-	var merged []string
+	type result struct {
+		trackers []string
+		err      error
+	}
+	results := make(chan result, len(sources))
+	var wg sync.WaitGroup
 	for _, source := range sources {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -2579,18 +2826,29 @@ func fetchPublicTrackers(ctx context.Context, sources []string, timeout time.Dur
 		if source == "" {
 			continue
 		}
-		trackers, err := fetchPublicTrackerSource(ctx, client, source)
-		if err != nil {
-			errs = append(errs, err)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			trackers, err := fetchPublicTrackerSource(ctx, client, source)
+			results <- result{trackers: trackers, err: err}
+		}()
+	}
+	wg.Wait()
+	close(results)
+
+	var errs []error
+	var merged []string
+	for item := range results {
+		if item.err != nil {
+			errs = append(errs, item.err)
 			continue
 		}
-		merged = mergeTrackers(merged, trackers)
-		if len(merged) >= maxPublicTrackers {
-			merged = merged[:maxPublicTrackers]
-			break
-		}
+		merged = mergeTrackers(merged, item.trackers)
 	}
 	if len(merged) > 0 {
+		if len(merged) > maxPublicTrackers {
+			merged = merged[:maxPublicTrackers]
+		}
 		return merged, nil
 	}
 	if len(errs) > 0 {
@@ -3195,22 +3453,29 @@ func removeEmptyParents(dir, root string) {
 }
 
 const (
-	publicTrackerSourceTimeout      = 8 * time.Second
-	publicTrackerHealthTimeout      = 12 * time.Second
-	publicTrackerProbeTimeout       = 3 * time.Second
-	publicTrackerHealthConcurrency  = 16
-	publicDhtHealthTimeout          = 10 * time.Second
-	publicDhtProbeTimeout           = 3 * time.Second
-	publicDhtHealthConcurrency      = 8
-	maxPublicTrackers               = 50
-	maxPublicTrackerSourceBytes     = 1 << 20
-	resourceDiscoveryTimeout        = 12 * time.Second
-	resourceTrackerProbeBudget      = 8 * time.Second
-	resourceTrackerProbeTimeout     = 4 * time.Second
-	resourceTrackerProbeConcurrency = 24
-	resourceDhtPeerWait             = 4 * time.Second
-	maxResourceProbeTrackers        = maxPublicTrackers
-	maxPreferredResourceTrackers    = 8
+	speedSmoothingWindow              = 8 * time.Second
+	speedIdleResetWindow              = 20 * time.Second
+	publicTrackerSourceTimeout        = 6 * time.Second
+	publicTrackerHealthTimeout        = 10 * time.Second
+	publicTrackerProbeTimeout         = 2 * time.Second
+	publicTrackerHealthConcurrency    = 48
+	publicDhtHealthTimeout            = 8 * time.Second
+	publicDhtProbeTimeout             = 2 * time.Second
+	publicDhtHealthConcurrency        = 16
+	maxPublicTrackers                 = 360
+	maxPublicTrackerSourceBytes       = 1 << 20
+	resourceDiscoveryTimeout          = 10 * time.Second
+	resourceTrackerProbeBudget        = 7 * time.Second
+	resourceTrackerProbeTimeout       = 2500 * time.Millisecond
+	resourceTrackerProbeConcurrency   = 192
+	resourceDhtPeerWait               = 4 * time.Second
+	maxResourceProbeTrackers          = maxPublicTrackers
+	maxPreferredResourceTrackers      = 80
+	activePeerDiscoveryInterval       = 12 * time.Second
+	activePeerDiscoveryPeerTarget     = 320
+	activePeerDiscoveryMaxTasks       = 3
+	activePeerDiscoveryStallThreshold = 30 * time.Second
+	discoverySourceRefreshInterval    = 30 * time.Minute
 )
 
 var publicTrackerProbeHTTPClient = &http.Client{
@@ -3221,6 +3486,8 @@ var publicTrackerSources = []string{
 	"https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_best.txt",
 	"https://newtrackon.com/api/stable",
 	"https://cf.trackerslist.com/best.txt",
+	"https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_all.txt",
+	"https://raw.githubusercontent.com/XIU2/TrackersListCollection/master/best.txt",
 }
 
 var defaultPublicTrackers = []string{
@@ -3244,6 +3511,21 @@ var defaultPublicTrackers = []string{
 	"http://tracker.renfei.net:8080/announce",
 	"https://tracker.gbitt.info:443/announce",
 	"http://tracker.mywaifu.best:6969/announce",
+	"udp://opentracker.io:6969/announce",
+	"udp://open.demonii.com:1337/announce",
+	"udp://tracker2.dler.org:80/announce",
+	"udp://tracker.filemail.com:6969/announce",
+	"udp://tracker1.bt.moack.co.kr:80/announce",
+	"udp://tracker.theoks.net:6969/announce",
+	"udp://tracker.srv00.com:6969/announce",
+	"udp://tracker.dump.cl:6969/announce",
+	"udp://open.tracker.cl:1337/announce",
+	"udp://open.dstud.io:6969/announce",
+	"udp://bt.ktrackers.com:6666/announce",
+	"http://tracker.openbittorrent.com:80/announce",
+	"udp://tracker.openbittorrent.com:6969/announce",
+	"http://open.acgnxtracker.com:80/announce",
+	"udp://open.acgnxtracker.com:80/announce",
 }
 
 var publicDhtBootstrapNodes = []string{
@@ -3256,6 +3538,12 @@ var publicDhtBootstrapNodes = []string{
 	"dht.anacrolix.link:42069",
 	"router.bittorrent.cloud:42069",
 	"router.bt.ouinet.work:6881",
+	"router.silotis.us:6881",
+	"dht.qingcloud.com:6881",
+	"router.bitcomet.com:6881",
+	"dht.libtorrent.org:25401",
+	"dht.transmissionbt.com:6881",
+	"dht.aelitis.com:6881",
 }
 
 var (
@@ -3817,7 +4105,7 @@ const indexHTML = `<!doctype html>
     <div class="settings-grid">
       <div>
         <label for="maxActive">同时下载任务</label>
-        <input id="maxActive" type="number" min="1" max="50" step="1" value="3">
+        <input id="maxActive" type="number" min="1" max="50" step="1" value="1">
       </div>
       <div>
         <label for="rateLimit">最大下载速度 MB/s</label>
@@ -4074,7 +4362,7 @@ async function loadSettings() {
   try {
     const res = await fetch("/api/settings");
     const settings = await res.json();
-    document.getElementById("maxActive").value = settings.maxActiveDownloads || 3;
+    document.getElementById("maxActive").value = settings.maxActiveDownloads || 1;
     document.getElementById("rateLimit").value = bytesToMB(settings.downloadRateLimitBytes);
     document.getElementById("waitForFiles").checked = !!settings.waitForFileSelection;
   } catch (err) {
