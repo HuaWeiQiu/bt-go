@@ -224,6 +224,53 @@ func TestRankTrackersByHealthPrefersResponsiveTracker(t *testing.T) {
 	}
 }
 
+func TestProbeResourceTrackersPrefersTrackerWithPeers(t *testing.T) {
+	peerful := startTestHTTPTracker(t, 3, 1, []map[string]interface{}{
+		{"ip": "127.0.0.1", "port": int64(6881)},
+	})
+	defer peerful.Close()
+	empty := startTestHTTPTracker(t, 0, 0, nil)
+	defer empty.Close()
+
+	results := probeResourceTrackers(
+		context.Background(),
+		[]string{empty.URL + "/announce", peerful.URL + "/announce", "udp://127.0.0.1:1/announce"},
+		metainfo.NewHashFromHex("0000000000000000000000000000000000000001"),
+		[20]byte{},
+		6881,
+	)
+	if len(results) != 3 {
+		t.Fatalf("expected three tracker results, got %#v", results)
+	}
+	if results[0].URL != peerful.URL+"/announce" {
+		t.Fatalf("expected tracker with peers first, got %#v", results)
+	}
+	best, peers, seeders, peerInfos := summarizeResourceTrackerProbes(results)
+	if len(best) == 0 || best[0] != peerful.URL+"/announce" {
+		t.Fatalf("expected preferred tracker list to start with peerful tracker, got %#v", best)
+	}
+	if peers != 1 || seeders != 3 || len(peerInfos) != 1 {
+		t.Fatalf("expected peers/seeders to reflect announce response, got peers=%d seeders=%d peerInfos=%d", peers, seeders, len(peerInfos))
+	}
+}
+
+func startTestHTTPTracker(t *testing.T, seeders, leechers int32, peers []map[string]interface{}) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		resp := map[string]interface{}{
+			"interval":   int64(1800),
+			"complete":   int64(seeders),
+			"incomplete": int64(leechers),
+			"peers":      peers,
+		}
+		raw, err := bencode.Marshal(resp)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = w.Write(raw)
+	}))
+}
+
 func TestRankDhtNodesByHealthPrefersResponsiveNode(t *testing.T) {
 	addr, closeServer := startTestDhtPingServer(t)
 	defer closeServer()
@@ -578,10 +625,10 @@ func TestUpdateFileSelectionAndPersistIt(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected file selection status 200, got %d body=%s", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), `"path":"video.mp4"`) || !strings.Contains(rec.Body.String(), `"selected":true`) {
-		t.Fatalf("expected selected video file, got body=%s", rec.Body.String())
+	if !strings.Contains(rec.Body.String(), `"path":"video.mp4"`) || !strings.Contains(rec.Body.String(), `"priority":"high"`) || !strings.Contains(rec.Body.String(), `"selected":true`) {
+		t.Fatalf("expected high-priority selected video file, got body=%s", rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), `"path":"sample.txt"`) || !strings.Contains(rec.Body.String(), `"selected":false`) {
+	if !strings.Contains(rec.Body.String(), `"path":"sample.txt"`) || !strings.Contains(rec.Body.String(), `"priority":"skip"`) || !strings.Contains(rec.Body.String(), `"selected":false`) {
 		t.Fatalf("expected skipped sample file, got body=%s", rec.Body.String())
 	}
 	cleanup()
@@ -622,7 +669,7 @@ func TestUpdateFilePrioritiesAndPersistThem(t *testing.T) {
 	}
 	id := mi.HashInfoBytes().HexString()
 
-	body := `{"priorities":{"video.mp4":"high","sample.txt":"skip"}}`
+	body := `{"priorities":{"video.mp4":"normal","sample.txt":"skip"}}`
 	req := httptest.NewRequest(http.MethodPut, "/api/tasks/"+id+"/files", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec = httptest.NewRecorder()
@@ -630,8 +677,8 @@ func TestUpdateFilePrioritiesAndPersistThem(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected file priority status 200, got %d body=%s", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), `"path":"video.mp4"`) || !strings.Contains(rec.Body.String(), `"priority":"high"`) || !strings.Contains(rec.Body.String(), `"selected":true`) {
-		t.Fatalf("expected high-priority video file, got body=%s", rec.Body.String())
+	if !strings.Contains(rec.Body.String(), `"path":"video.mp4"`) || !strings.Contains(rec.Body.String(), `"priority":"normal"`) || !strings.Contains(rec.Body.String(), `"selected":true`) {
+		t.Fatalf("expected normal-priority video file, got body=%s", rec.Body.String())
 	}
 	if !strings.Contains(rec.Body.String(), `"path":"sample.txt"`) || !strings.Contains(rec.Body.String(), `"priority":"skip"`) || !strings.Contains(rec.Body.String(), `"selected":false`) {
 		t.Fatalf("expected skipped sample file, got body=%s", rec.Body.String())
@@ -654,8 +701,8 @@ func TestUpdateFilePrioritiesAndPersistThem(t *testing.T) {
 		priorities[file.Path] = file.Priority
 		selected[file.Path] = file.Selected
 	}
-	if priorities["video.mp4"] != "high" || !selected["video.mp4"] {
-		t.Fatalf("expected restored high video priority, got priorities=%#v selected=%#v", priorities, selected)
+	if priorities["video.mp4"] != "normal" || !selected["video.mp4"] {
+		t.Fatalf("expected restored normal video priority, got priorities=%#v selected=%#v", priorities, selected)
 	}
 	if priorities["sample.txt"] != "skip" || selected["sample.txt"] {
 		t.Fatalf("expected restored skipped sample priority, got priorities=%#v selected=%#v", priorities, selected)

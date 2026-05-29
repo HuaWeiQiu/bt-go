@@ -113,11 +113,10 @@ bt-go-desktop-darwin-arm64
 bt-go-desktop-darwin-arm64.zip
 bt-go-desktop-linux-amd64
 bt-go-desktop-linux-amd64.zip
-app-debug.apk
 ```
 
 GitHub Actions release packaging is available in `.github/workflows/release.yml`. Push a tag like
-`v0.1.0` or run the workflow manually to build zipped desktop artifacts and SHA256 files.
+`v0.1.0` or run the workflow manually to build desktop artifacts, zipped copies, and SHA256 files.
 
 ## API
 
@@ -188,6 +187,9 @@ curl -X POST http://127.0.0.1:8088/api/tasks/{infoHash}/refresh-discovery
 
 This re-adds the task trackers and starts a short DHT announce pass. It is useful when a task has
 metadata but no active peers, or when it sits at `0 B/s` for a while.
+The task status exposes `discoveryStatus`, `discoveryPeers`, `discoverySeeders`,
+`discoveryTrackers`, and `discoveryCheckedAt` so the UI can show whether the resource was confirmed
+from tracker/DHT discovery.
 
 Select files in a metadata-ready task:
 
@@ -205,9 +207,9 @@ curl -s -X PUT http://127.0.0.1:8088/api/tasks/{infoHash}/files \
   -d '{"priorities":{"video.mp4":"high","sample.txt":"skip","subtitle.srt":"normal"}}'
 ```
 
-Priority values are `high`, `normal`, and `skip`. The older `files` list is still accepted and is
-treated as `normal` priority for the listed files. Send an empty file list or an empty priority map
-to skip all files until another selection is saved.
+Priority values are `high`, `normal`, and `skip`. The older `files` list is still accepted and now
+treats the listed files as `high` priority by default. Send an empty file list or an empty priority
+map to skip all files until another selection is saved.
 
 Open the download directory or a task/file path on the local machine:
 
@@ -257,10 +259,11 @@ saved, which is useful for multi-file torrents.
 Settings are persisted automatically after updates.
 
 Task status includes `diagnostic`, `diagnosticCode`, `dhtEnabled`, `dhtServers`, `listenAddrs`,
-`knownPeers`, `etaSeconds`, `stalled`, `stalledSeconds`, and `files` when metadata is ready. The
-diagnostic fields explain whether a task is waiting for metadata, has no peers, is connecting to
-peers, has no seeders, is stalled, or is downloading normally. The aggregate size/progress is
-calculated from the selected files, so skipped files do not inflate the ETA.
+`knownPeers`, `discoveryStatus`, `discoveryPeers`, `etaSeconds`, `stalled`, `stalledSeconds`, and
+`files` when metadata is ready. The diagnostic fields explain whether a task is waiting for
+metadata, has no peers, is connecting to peers, has no seeders, is stalled, or is downloading
+normally. The aggregate size/progress is calculated from the selected files, so skipped files do not
+inflate the ETA.
 
 ## Verification
 
@@ -273,10 +276,10 @@ GOTOOLCHAIN=go1.26.3 go vet ./...
 GOTOOLCHAIN=go1.26.3 go vet -tags desktop ./...
 ```
 
-Live HTTP verification was also run against the official Ubuntu 26.04 torrent file. With
-`maxActiveDownloads=1` and `downloadRateLimitBytes=1048576`, the task entered `downloading`, found
-438 peers with 33 active seeders, and reported about `879814 B/s` during the short test window.
-The temporary task, service, and download directory were removed after verification.
+Live HTTP verification was also run against the WebTorrent public fixture `leaves.torrent`. The
+single selected file `Leaves of Grass by Walt Whitman.epub` completed successfully with
+`totalBytes=362017`, `completedBytes=362017`, default `high` priority, and SHA256
+`d6d19f442444b9cd84e64441772f113e7b6844058dcee08238093c99faab083d`.
 
 ## Notes
 

@@ -26,6 +26,7 @@ import (
 	"github.com/anacrolix/dht/v2"
 	"github.com/anacrolix/torrent"
 	"github.com/anacrolix/torrent/metainfo"
+	"github.com/anacrolix/torrent/tracker"
 	"go.etcd.io/bbolt"
 	"golang.org/x/time/rate"
 )
@@ -70,6 +71,11 @@ type downloadTask struct {
 	Active            bool      `json:"active"`
 	Paused            bool      `json:"paused"`
 	AwaitingSelection bool      `json:"awaitingSelection"`
+	DiscoveryStatus   string    `json:"discoveryStatus,omitempty"`
+	DiscoveryPeers    int       `json:"discoveryPeers,omitempty"`
+	DiscoverySeeders  int       `json:"discoverySeeders,omitempty"`
+	DiscoveryTrackers []string  `json:"discoveryTrackers,omitempty"`
+	DiscoveryChecked  time.Time `json:"discoveryCheckedAt,omitempty"`
 
 	metaInfo         []byte
 	fileSelection    map[string]bool
@@ -172,6 +178,11 @@ type taskStatus struct {
 	DHTEnabled        bool             `json:"dhtEnabled"`
 	DHTServers        int              `json:"dhtServers"`
 	ListenAddrs       []string         `json:"listenAddrs"`
+	DiscoveryStatus   string           `json:"discoveryStatus,omitempty"`
+	DiscoveryPeers    int              `json:"discoveryPeers,omitempty"`
+	DiscoverySeeders  int              `json:"discoverySeeders,omitempty"`
+	DiscoveryTrackers []string         `json:"discoveryTrackers,omitempty"`
+	DiscoveryChecked  *time.Time       `json:"discoveryCheckedAt,omitempty"`
 	KnownPeers        int              `json:"knownPeers"`
 	BytesReadData     int64            `json:"bytesReadData"`
 	BytesWasted       int64            `json:"bytesWasted"`
@@ -606,19 +617,20 @@ func (m *downloadManager) add(magnet string) (*downloadTask, error) {
 
 	now := time.Now()
 	task := &downloadTask{
-		ID:        id,
-		Magnet:    magnet,
-		Name:      mi.DisplayName,
-		InfoHash:  id,
-		Status:    "metadata",
-		SavePath:  m.dataDir,
-		Source:    "magnet",
-		Trackers:  trackerList,
-		Order:     m.nextOrder(),
-		CreatedAt: now,
-		UpdatedAt: now,
-		torrent:   t,
-		done:      make(chan struct{}),
+		ID:              id,
+		Magnet:          magnet,
+		Name:            mi.DisplayName,
+		InfoHash:        id,
+		Status:          "metadata",
+		SavePath:        m.dataDir,
+		Source:          "magnet",
+		Trackers:        trackerList,
+		Order:           m.nextOrder(),
+		CreatedAt:       now,
+		UpdatedAt:       now,
+		DiscoveryStatus: discoveryStatusForPrivate(false),
+		torrent:         t,
+		done:            make(chan struct{}),
 	}
 	if m.getSettings().WaitForFileSelection && t.Info() != nil {
 		task.AwaitingSelection = true
@@ -633,6 +645,7 @@ func (m *downloadManager) add(magnet string) (*downloadTask, error) {
 		_, _ = m.delete(id, false)
 		return nil, err
 	}
+	go m.preflightDiscovery(task)
 	m.schedule()
 	go m.watch(task)
 	return task, nil
@@ -686,21 +699,22 @@ func (m *downloadManager) addTorrent(r io.Reader) (*downloadTask, error) {
 
 	now := time.Now()
 	task := &downloadTask{
-		ID:        id,
-		Magnet:    magnet.String(),
-		Name:      info.BestName(),
-		InfoHash:  id,
-		Status:    "metadata",
-		SavePath:  m.dataDir,
-		Source:    "torrent",
-		Trackers:  trackers(&magnet),
-		Private:   private,
-		Order:     m.nextOrder(),
-		CreatedAt: now,
-		UpdatedAt: now,
-		metaInfo:  raw,
-		torrent:   t,
-		done:      make(chan struct{}),
+		ID:              id,
+		Magnet:          magnet.String(),
+		Name:            info.BestName(),
+		InfoHash:        id,
+		Status:          "metadata",
+		SavePath:        m.dataDir,
+		Source:          "torrent",
+		Trackers:        trackers(&magnet),
+		Private:         private,
+		Order:           m.nextOrder(),
+		CreatedAt:       now,
+		UpdatedAt:       now,
+		DiscoveryStatus: discoveryStatusForPrivate(private),
+		metaInfo:        raw,
+		torrent:         t,
+		done:            make(chan struct{}),
 	}
 	if m.getSettings().WaitForFileSelection && t.Info() != nil {
 		task.AwaitingSelection = true
@@ -715,6 +729,7 @@ func (m *downloadManager) addTorrent(r io.Reader) (*downloadTask, error) {
 		_, _ = m.delete(id, false)
 		return nil, err
 	}
+	go m.preflightDiscovery(task)
 	m.schedule()
 	go m.watch(task)
 	return task, nil
@@ -821,6 +836,7 @@ func (m *downloadManager) restoreTasks(saved []persistedTask) error {
 		m.mu.Lock()
 		m.tasks[id] = task
 		m.mu.Unlock()
+		go m.preflightDiscovery(task)
 		go m.watch(task)
 	}
 	m.schedule()
@@ -1034,7 +1050,7 @@ func (m *downloadManager) updateFileSelection(id string, req fileSelectionReques
 			return nil, fmt.Errorf("unknown file: %s", file)
 		}
 		if _, ok := priorities[file]; !ok {
-			priorities[file] = "normal"
+			priorities[file] = defaultFilePriority
 		}
 	}
 	task.setFilePriorities(priorities, true)
@@ -1105,6 +1121,7 @@ func (m *downloadManager) refreshDiscovery(id string) (*downloadTask, error) {
 		tor.AddTrackers(trackerTiers(trackers))
 	}
 	m.announceToDht(tor, task.Private)
+	go m.preflightDiscovery(task)
 	m.schedule()
 	return task, nil
 }
@@ -1127,6 +1144,275 @@ func (m *downloadManager) announceToDht(tor *torrent.Torrent, private bool) {
 		}()
 	}
 }
+
+func (m *downloadManager) preflightDiscovery(task *downloadTask) {
+	if m == nil || task == nil {
+		return
+	}
+	task.mu.Lock()
+	tor := task.torrent
+	private := task.Private
+	trackers := append([]string(nil), task.Trackers...)
+	task.mu.Unlock()
+	if tor == nil || private {
+		return
+	}
+
+	task.setDiscovery("checking", 0, 0, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), resourceDiscoveryTimeout)
+	defer cancel()
+	stopOnTaskDone := make(chan struct{})
+	go func() {
+		select {
+		case <-task.done:
+			cancel()
+		case <-stopOnTaskDone:
+		}
+	}()
+	defer close(stopOnTaskDone)
+
+	results := probeResourceTrackers(ctx, trackers, tor.InfoHash(), m.client.PeerID(), localPeerPort(m.client.LocalPort()))
+	bestTrackers, trackerPeers, trackerSeeders, trackerPeerInfos := summarizeResourceTrackerProbes(results)
+	if len(trackerPeerInfos) > 0 {
+		tor.AddPeers(trackerPeerInfos)
+	}
+	if len(bestTrackers) > 0 && task.prioritizeTrackers(bestTrackers) {
+		tor.AddTrackers(trackerTiers(task.trackersSnapshot()))
+		if err := m.saveState(); err != nil {
+			log.Printf("save ranked tracker state failed: %v", err)
+		}
+	}
+
+	m.announceToDht(tor, private)
+	dhtPeers := 0
+	if trackerPeers == 0 && trackerSeeders == 0 {
+		dhtPeers = waitForDhtPeers(ctx, task, tor, resourceDhtPeerWait)
+	}
+	totalPeers := trackerPeers + dhtPeers
+	status := "unknown"
+	if totalPeers > 0 || trackerSeeders > 0 {
+		status = "available"
+	}
+	if errors.Is(ctx.Err(), context.Canceled) {
+		status = "unknown"
+	}
+	task.setDiscovery(status, totalPeers, trackerSeeders, bestTrackers)
+	if status == "available" {
+		log.Printf("resource preflight %s: peers=%d seeders=%d preferred_trackers=%d", task.ID, totalPeers, trackerSeeders, len(bestTrackers))
+	} else {
+		log.Printf("resource preflight %s: no confirmed peers yet", task.ID)
+	}
+	m.schedule()
+}
+
+type resourceTrackerProbe struct {
+	URL      string
+	RTT      time.Duration
+	Peers    []torrent.PeerInfo
+	Seeders  int
+	Leechers int
+	OK       bool
+	Err      string
+}
+
+func probeResourceTrackers(ctx context.Context, trackerURLs []string, infoHash metainfo.Hash, peerID torrent.PeerID, port uint16) []resourceTrackerProbe {
+	trackerURLs = mergeTrackers(trackerURLs, nil)
+	if len(trackerURLs) > maxResourceProbeTrackers {
+		trackerURLs = trackerURLs[:maxResourceProbeTrackers]
+	}
+	if len(trackerURLs) == 0 {
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, resourceTrackerProbeBudget)
+	defer cancel()
+	sem := make(chan struct{}, resourceTrackerProbeConcurrency)
+	results := make(chan resourceTrackerProbe, len(trackerURLs))
+	var wg sync.WaitGroup
+	for _, trackerURL := range trackerURLs {
+		trackerURL := trackerURL
+		if ctx.Err() != nil {
+			break
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-ctx.Done():
+				results <- resourceTrackerProbe{URL: trackerURL, Err: ctx.Err().Error()}
+				return
+			}
+			results <- announceResourceTracker(ctx, trackerURL, infoHash, peerID, port)
+		}()
+	}
+	wg.Wait()
+	close(results)
+
+	ranked := make([]resourceTrackerProbe, 0, len(trackerURLs))
+	for item := range results {
+		ranked = append(ranked, item)
+	}
+	sort.SliceStable(ranked, func(i, j int) bool {
+		return resourceTrackerProbeLess(ranked[i], ranked[j])
+	})
+	return ranked
+}
+
+func announceResourceTracker(ctx context.Context, trackerURL string, infoHash metainfo.Hash, peerID torrent.PeerID, port uint16) resourceTrackerProbe {
+	start := time.Now()
+	result := resourceTrackerProbe{URL: trackerURL}
+	client, err := tracker.NewClient(trackerURL, tracker.NewClientOpts{})
+	if err != nil {
+		result.Err = err.Error()
+		return result
+	}
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(ctx, resourceTrackerProbeTimeout)
+	defer cancel()
+	resp, err := client.Announce(ctx, tracker.AnnounceRequest{
+		InfoHash: infoHash,
+		PeerId:   peerID,
+		Left:     -1,
+		Uploaded: 0,
+		Event:    tracker.Started,
+		NumWant:  50,
+		Port:     port,
+	}, tracker.AnnounceOpt{UserAgent: "bt-go/1.0"})
+	result.RTT = time.Since(start)
+	if err != nil {
+		result.Err = err.Error()
+		return result
+	}
+	result.OK = true
+	result.Seeders = int(resp.Seeders)
+	result.Leechers = int(resp.Leechers)
+	result.Peers = trackerPeersToTorrentPeers(resp.Peers)
+	return result
+}
+
+func trackerPeersToTorrentPeers(peers []tracker.Peer) []torrent.PeerInfo {
+	result := make([]torrent.PeerInfo, 0, len(peers))
+	for _, peer := range peers {
+		if peer.IP == nil || peer.Port <= 0 || peer.Port > 65535 {
+			continue
+		}
+		info := torrent.PeerInfo{
+			Addr:   stringPeerAddr(net.JoinHostPort(peer.IP.String(), fmt.Sprintf("%d", peer.Port))),
+			Source: torrent.PeerSourceTracker,
+		}
+		copy(info.Id[:], peer.ID)
+		result = append(result, info)
+	}
+	return result
+}
+
+func summarizeResourceTrackerProbes(results []resourceTrackerProbe) (bestTrackers []string, peers, seeders int, peerInfos []torrent.PeerInfo) {
+	for _, item := range results {
+		if !item.OK {
+			continue
+		}
+		if resourceTrackerScore(item) > 0 && len(bestTrackers) < maxPreferredResourceTrackers {
+			bestTrackers = append(bestTrackers, item.URL)
+		}
+		peers += len(item.Peers)
+		if item.Seeders > 0 {
+			seeders += item.Seeders
+		}
+		peerInfos = append(peerInfos, item.Peers...)
+	}
+	return bestTrackers, peers, seeders, dedupePeerInfos(peerInfos)
+}
+
+func resourceTrackerProbeLess(left, right resourceTrackerProbe) bool {
+	if left.OK != right.OK {
+		return left.OK
+	}
+	leftScore := resourceTrackerScore(left)
+	rightScore := resourceTrackerScore(right)
+	if leftScore != rightScore {
+		return leftScore > rightScore
+	}
+	if left.RTT != right.RTT {
+		if left.RTT == 0 {
+			return false
+		}
+		if right.RTT == 0 {
+			return true
+		}
+		return left.RTT < right.RTT
+	}
+	return left.URL < right.URL
+}
+
+func resourceTrackerScore(result resourceTrackerProbe) int {
+	if !result.OK {
+		return 0
+	}
+	return result.Seeders*4 + len(result.Peers)*2 + result.Leechers
+}
+
+func dedupePeerInfos(peers []torrent.PeerInfo) []torrent.PeerInfo {
+	seen := make(map[string]struct{}, len(peers))
+	result := make([]torrent.PeerInfo, 0, len(peers))
+	for _, peer := range peers {
+		if peer.Addr == nil {
+			continue
+		}
+		key := peer.Addr.String()
+		if key == "" {
+			continue
+		}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		result = append(result, peer)
+	}
+	return result
+}
+
+func waitForDhtPeers(ctx context.Context, task *downloadTask, tor *torrent.Torrent, timeout time.Duration) int {
+	before := len(tor.KnownSwarm())
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return positiveDiff(len(tor.KnownSwarm()), before)
+		case <-task.done:
+			return positiveDiff(len(tor.KnownSwarm()), before)
+		case <-timer.C:
+			return positiveDiff(len(tor.KnownSwarm()), before)
+		case <-ticker.C:
+			if current := len(tor.KnownSwarm()); current > before {
+				return current - before
+			}
+		}
+	}
+}
+
+func positiveDiff(current, previous int) int {
+	if current > previous {
+		return current - previous
+	}
+	return 0
+}
+
+func localPeerPort(port int) uint16 {
+	if port <= 0 || port > 65535 {
+		return 0
+	}
+	return uint16(port)
+}
+
+type stringPeerAddr string
+
+func (stringPeerAddr) Network() string     { return "" }
+func (addr stringPeerAddr) String() string { return string(addr) }
 
 func (m *downloadManager) refreshDiscoverySources(ctx context.Context) {
 	if m == nil || m.discovery == nil {
@@ -1326,6 +1612,11 @@ func (m *downloadManager) status(task *downloadTask) taskStatus {
 	stalled := active && missing > 0 && speed < 1 && stalledSeconds >= 30
 	dhtServers := len(m.client.DhtServers())
 	listenAddrs := listenerStrings(m.client.ListenAddrs())
+	discoveryStatus, discoveryPeers, discoverySeeders, discoveryTrackers, discoveryChecked := task.discoverySnapshot()
+	var discoveryCheckedAt *time.Time
+	if !discoveryChecked.IsZero() {
+		discoveryCheckedAt = &discoveryChecked
+	}
 	diagnosticCode, diagnostic := taskDiagnostic(status, metadataReady, active, paused, task.isAwaitingSelection(), missing, speed, metadataAge, stalledSeconds, peers, pendingPeers, halfOpenPeers, activePeers, seeders, len(task.Trackers), dhtServers, len(listenAddrs))
 	return taskStatus{
 		ID:                task.ID,
@@ -1352,6 +1643,11 @@ func (m *downloadManager) status(task *downloadTask) taskStatus {
 		DHTEnabled:        dhtServers > 0,
 		DHTServers:        dhtServers,
 		ListenAddrs:       listenAddrs,
+		DiscoveryStatus:   discoveryStatus,
+		DiscoveryPeers:    discoveryPeers,
+		DiscoverySeeders:  discoverySeeders,
+		DiscoveryTrackers: discoveryTrackers,
+		DiscoveryChecked:  discoveryCheckedAt,
 		KnownPeers:        knownPeers,
 		BytesReadData:     bytesReadData,
 		BytesWasted:       bytesWasted,
@@ -1599,6 +1895,57 @@ func (t *downloadTask) setOrder(order int64) {
 	t.mu.Unlock()
 }
 
+func (t *downloadTask) setDiscovery(status string, peers, seeders int, trackers []string) {
+	t.mu.Lock()
+	t.DiscoveryStatus = status
+	t.DiscoveryPeers = peers
+	t.DiscoverySeeders = seeders
+	t.DiscoveryTrackers = append([]string(nil), trackers...)
+	t.DiscoveryChecked = time.Now()
+	t.UpdatedAt = time.Now()
+	t.mu.Unlock()
+}
+
+func (t *downloadTask) discoverySnapshot() (status string, peers, seeders int, trackers []string, checked time.Time) {
+	t.mu.Lock()
+	status = t.DiscoveryStatus
+	peers = t.DiscoveryPeers
+	seeders = t.DiscoverySeeders
+	trackers = append([]string(nil), t.DiscoveryTrackers...)
+	checked = t.DiscoveryChecked
+	t.mu.Unlock()
+	return
+}
+
+func (t *downloadTask) trackersSnapshot() []string {
+	t.mu.Lock()
+	trackers := append([]string(nil), t.Trackers...)
+	t.mu.Unlock()
+	return trackers
+}
+
+func (t *downloadTask) prioritizeTrackers(preferred []string) bool {
+	t.mu.Lock()
+	ranked := mergeTrackers(preferred, t.Trackers)
+	if stringSlicesEqual(t.Trackers, ranked) {
+		t.mu.Unlock()
+		return false
+	}
+	t.Trackers = ranked
+	t.UpdatedAt = time.Now()
+	t.mu.Unlock()
+	return true
+}
+
+func discoveryStatusForPrivate(private bool) string {
+	if private {
+		return ""
+	}
+	return "checking"
+}
+
+const defaultFilePriority = "high"
+
 func (t *downloadTask) sortSnapshot() taskSortSnapshot {
 	t.mu.Lock()
 	snapshot := taskSortSnapshot{
@@ -1707,10 +2054,15 @@ func (t *downloadTask) startDownload() {
 	t.Status = "downloading"
 	t.Error = ""
 	t.UpdatedAt = time.Now()
+	fileSelectionSet := t.fileSelectionSet
 	t.mu.Unlock()
 
 	tor.AllowDataDownload()
-	t.applyFileSelection()
+	if fileSelectionSet {
+		t.applyFileSelection()
+	} else {
+		tor.DownloadAll()
+	}
 
 	shouldStop := false
 	t.mu.Lock()
@@ -1881,7 +2233,7 @@ func (t *downloadTask) applyFileSelection() {
 		}
 		priority := priorities[file.DisplayPath()]
 		if priority == "" && selection[file.DisplayPath()] {
-			priority = "normal"
+			priority = defaultFilePriority
 		}
 		switch priority {
 		case "high":
@@ -1984,8 +2336,10 @@ func (t *downloadTask) progressSnapshot() (total, completed, missing int64, file
 		if fileSelectionSet && file.Priority() == torrent.PiecePriorityNone {
 			selected = false
 		}
-		if priority == "" {
+		if priority == "" && fileSelectionSet {
 			priority = priorityLabel(file.Priority())
+		} else if priority == "" {
+			priority = defaultFilePriority
 		}
 		result = append(result, taskFileStatus{
 			Path:            path,
@@ -2675,7 +3029,7 @@ func prioritiesFromState(files []string, saved map[string]string) map[string]str
 	for _, file := range files {
 		file = strings.TrimSpace(filepath.ToSlash(file))
 		if file != "" {
-			priorities[file] = "normal"
+			priorities[file] = defaultFilePriority
 		}
 	}
 	for file, priority := range saved {
@@ -2697,10 +3051,12 @@ func prioritiesFromState(files []string, saved map[string]string) map[string]str
 
 func normalizeFilePriority(priority string) (string, error) {
 	switch strings.TrimSpace(strings.ToLower(priority)) {
-	case "", "normal", "selected":
-		return "normal", nil
 	case "high":
 		return "high", nil
+	case "", "selected":
+		return defaultFilePriority, nil
+	case "normal":
+		return "normal", nil
 	case "skip", "none", "unselected":
 		return "skip", nil
 	default:
@@ -2839,15 +3195,22 @@ func removeEmptyParents(dir, root string) {
 }
 
 const (
-	publicTrackerSourceTimeout     = 8 * time.Second
-	publicTrackerHealthTimeout     = 12 * time.Second
-	publicTrackerProbeTimeout      = 3 * time.Second
-	publicTrackerHealthConcurrency = 16
-	publicDhtHealthTimeout         = 10 * time.Second
-	publicDhtProbeTimeout          = 3 * time.Second
-	publicDhtHealthConcurrency     = 8
-	maxPublicTrackers              = 50
-	maxPublicTrackerSourceBytes    = 1 << 20
+	publicTrackerSourceTimeout      = 8 * time.Second
+	publicTrackerHealthTimeout      = 12 * time.Second
+	publicTrackerProbeTimeout       = 3 * time.Second
+	publicTrackerHealthConcurrency  = 16
+	publicDhtHealthTimeout          = 10 * time.Second
+	publicDhtProbeTimeout           = 3 * time.Second
+	publicDhtHealthConcurrency      = 8
+	maxPublicTrackers               = 50
+	maxPublicTrackerSourceBytes     = 1 << 20
+	resourceDiscoveryTimeout        = 12 * time.Second
+	resourceTrackerProbeBudget      = 8 * time.Second
+	resourceTrackerProbeTimeout     = 4 * time.Second
+	resourceTrackerProbeConcurrency = 24
+	resourceDhtPeerWait             = 4 * time.Second
+	maxResourceProbeTrackers        = maxPublicTrackers
+	maxPreferredResourceTrackers    = 8
 )
 
 var publicTrackerProbeHTTPClient = &http.Client{
@@ -3548,6 +3911,9 @@ function shortHash(value) {
 }
 
 function shortDiagnostic(task) {
+  if (task.discoveryStatus === "checking") return "正在探测 Tracker/DHT";
+  if (task.discoveryStatus === "available") return "资源已确认可用";
+  if (task.discoveryStatus === "unknown") return "资源暂未确认";
   const map = {
     completed: "完成",
     metadata_timeout: "元数据超时",
@@ -3571,9 +3937,19 @@ function shortDiagnostic(task) {
   return map[task.diagnosticCode] || statusText(task.status);
 }
 
+function discoveryLabel(task) {
+  if (task.discoveryStatus === "checking") return "探测源";
+  if (task.discoveryStatus === "available") {
+    const peers = task.discoveryPeers || task.knownPeers || task.peers || 0;
+    return peers > 0 ? "可用 " + peers + "P" : "资源可用";
+  }
+  if (task.discoveryStatus === "unknown") return "待确认";
+  return "";
+}
+
 function filePriorityValue(file) {
   if (file && validFilePriorities.has(file.priority)) return file.priority;
-  return file && file.selected ? "normal" : "skip";
+  return file && file.selected ? "high" : "skip";
 }
 
 function filePriorityFor(task, file) {
@@ -3893,14 +4269,14 @@ function renderTaskFiles(tbody, task) {
   title.textContent = "文件 " + selectedCount + "/" + task.files.length;
   const fileActions = document.createElement("div");
   fileActions.className = "file-actions";
-  const all = document.createElement("button");
-  all.className = "secondary compact";
-  all.textContent = "全部普通";
-  all.onclick = () => setTaskFilePriority(task.id, "normal");
   const high = document.createElement("button");
   high.className = "secondary compact";
   high.textContent = "全部高级";
   high.onclick = () => setTaskFilePriority(task.id, "high");
+  const all = document.createElement("button");
+  all.className = "secondary compact";
+  all.textContent = "全部普通";
+  all.onclick = () => setTaskFilePriority(task.id, "normal");
   const none = document.createElement("button");
   none.className = "secondary compact";
   none.textContent = "全部跳过";
@@ -3987,7 +4363,8 @@ function renderTask(tbody, task) {
   pill.textContent = statusText(task.status);
   const meta = document.createElement("div");
   meta.className = "muted";
-  meta.textContent = task.queued ? "队列 " + task.queuePosition : (task.active ? "运行" : "待命");
+  const discovery = discoveryLabel(task);
+  meta.textContent = discovery || (task.queued ? "队列 " + task.queuePosition : (task.active ? "运行" : "待命"));
   statusWrap.append(pill, meta);
   tr.appendChild(cell("状态", statusWrap));
 
